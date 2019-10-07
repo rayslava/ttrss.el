@@ -27,7 +27,7 @@
 
 ;;; Code:
 
-(load-file "ttrss.el")
+(require 'ttrss)
 (require 'gnus)
 (require 'nnoo)
 (require 'nnmail)
@@ -81,6 +81,11 @@ lists of SQL IDs to article numbers.")
 
 
 ;;; Interface bits
+(defun nnttrss-decode-gnus-group (group)
+  (decode-coding-string group 'utf-8))
+
+(defun nnttrss-encode-gnus-group (group)
+  (encode-coding-string group 'utf-8))
 
 (deffoo nnttrss-open-server (server &optional defs)
   (if (nnttrss-server-opened server)
@@ -137,6 +142,7 @@ lists of SQL IDs to article numbers.")
   nnttrss-status-string)
 
 (deffoo nnttrss-request-group (group &optional server fast info)
+  (setq group (nnttrss-decode-gnus-group group))
   (if fast
       t
     (let* ((feed (cdr (assoc group nnttrss--feeds)))
@@ -148,11 +154,14 @@ lists of SQL IDs to article numbers.")
 			  total-articles
 			  (apply 'min article-ids)
 			  (apply 'max article-ids)
-			  group))
+			  (nnimap-encode-gnus-group group)))
 	(insert (format "211 %d %d %d \"%s\"\n"
-			total-articles 1 0 group))))))
+			total-articles 1 0
+			(nnimap-encode-gnus-group group)))))))
 
 (deffoo nnttrss-retrieve-headers (articles &optional group server fetch-old)
+  (when group
+    (setq group (nnttrss-decode-gnus-group group)))
   (with-current-buffer nntp-server-buffer
     (erase-buffer)
     (dolist (article articles)
@@ -160,6 +169,8 @@ lists of SQL IDs to article numbers.")
   'nov)
 
 (deffoo nnttrss-request-article (article &optional group server to-buffer)
+  (when group
+    (setq group (nnttrss-decode-gnus-group group)))
   (let ((destination (or to-buffer nntp-server-buffer))
 	(article (nnttrss--find-article article group)))
     (with-current-buffer destination
@@ -218,7 +229,8 @@ Sets the variables VARS'."
 					;(setf (symbol-value var) nil)
     (let* ((name (symbol-name var))
 	   (file (nnttrss-make-filename name))
-	   (file-name-coding-system nnmail-pathname-coding-system))
+	   (file-name-coding-system nnmail-pathname-coding-system)
+	   (coding-system-for-read mm-universal-coding-system))
       (when (file-exists-p file)
 	(load file nil t t)))))
 
@@ -261,7 +273,8 @@ Assumes the variable 'nnttrss--feeds' is set."
   "Update 'nnttrss--feeds'."
   (let ((feeds (ttrss-get-feeds nnttrss-address
 				nnttrss--sid
-				:feed_id -4)))
+				:include_nested t
+				:cat_id -4)))
     (setq nnttrss--feeds (mapcar (lambda (f) (cons (plist-get f :title) f))
 				 feeds)))
   (nnttrss--write-feeds))
@@ -306,6 +319,16 @@ Assumes the variables 'nnttrss--article-map' and
   (setq nnttrss--last-article-id (apply 'max (mapcar 'car nnttrss--headlines)))
   (nnttrss--write-article-map))
 
+(defun nnttrss--update-article-map-for-all ()
+  "Update 'nnttrss--article-map' with new articles in 'nnttrss--headlines'."
+  (dolist (headline (mapcar 'cdr nnttrss--headlines))
+    (let* ((article-id (plist-get headline :id))
+	   (group -4))
+      (when (> article-id nnttrss--last-article-id)
+	(nnttrss--update-single-article-map article-id -4))))
+  (setq nnttrss--last-article-id (apply 'max (mapcar 'car nnttrss--headlines)))
+  (nnttrss--write-article-map))
+
 (defun nnttrss--get-article-number (article-id group)
   "Return article number corresponding to ARTICLE-ID in GROUP.
 Note that ARTICLE-ID is an internal SQL identifier obtained from the API.
@@ -330,17 +353,17 @@ Assumes the variable 'nnttrss--headlines' is set."
 
 (defun nnttrss--update-headlines ()
   "Update 'nnttrss--headlines' since 'nnttrss--last-article-id'."
-  (let* ((headlines (append nnttrss--headlines
-			    (ttrss-get-headlines
-			     nnttrss-address
-			     nnttrss--sid
-			     :feed_id -4
-			     :limit -1
-			     :since_id nnttrss--last-article-id
-			     :show_content (not nnttrss-fetch-partial-articles)))))
-    (setq nnttrss--headlines (mapcar (lambda (h)
-				       (cons (plist-get h :id) h))
-				     headlines)))
+  (let* ((headlines (ttrss-get-headlines
+		     nnttrss-address
+		     nnttrss--sid
+		     :feed_id -4
+		     :limit -1
+		     :since_id nnttrss--last-article-id
+		     :show_content (not nnttrss-fetch-partial-articles))))
+    (setq nnttrss--headlines (append nnttrss--headlines
+				     (mapcar (lambda (h)
+					       (cons (plist-get h :id) h))
+					     headlines))))
   (nnttrss--write-headlines))
 
 (provide 'nnttrss)
