@@ -195,7 +195,7 @@ lists of SQL IDs to article numbers.")
 (defun nnttrss--find-article (number group)
   "Return property list for article NUMBER in GROUP."
   (let* ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
-	 (article-id (nnttrss--get-article-id number (number-to-string group-id)))
+	 (article-id (nnttrss--get-article-id number group-id))
 	 (article (cdr (assoc article-id nnttrss--headlines)))
 	 (content (or (plist-get article :content)
 		      (nth 1 (ttrss-get-article nnttrss-address nnttrss--sid article-id)))))
@@ -206,7 +206,7 @@ lists of SQL IDs to article numbers.")
 (defun nnttrss--format-header (number group)
   "Return headline NUMBER in GROUP formated in nov format."
   (let* ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
-	 (article-id (nnttrss--get-article-id number (number-to-string group-id)))
+	 (article-id (nnttrss--get-article-id number group-id))
 	 (article (nnttrss--find-article number group)))
     (if article
 	(format "%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%S\n"
@@ -281,7 +281,7 @@ Assumes the variable 'nnttrss--feeds' is set."
 
 (defun nnttrss--feed-articles (feed-id)
   "Return list of article numbers corresponding to article IDs in FEED-ID."
-  (let ((feed-article-map (lax-plist-get nnttrss--article-map (number-to-string feed-id))))
+  (let ((feed-article-map (lax-plist-get nnttrss--article-map feed-id)))
     (mapcar 'cdr feed-article-map)))
 
 (defun nnttrss--read-article-map ()
