@@ -142,22 +142,25 @@ lists of SQL IDs to article numbers.")
   nnttrss-status-string)
 
 (deffoo nnttrss-request-group (group &optional server fast info)
-  (setq group (nnttrss-decode-gnus-group group))
-  (if fast
-      t
-    (let* ((feed (cdr (assoc group nnttrss--feeds)))
-	   (id (plist-get feed :id))
-	   (article-ids (nnttrss--feed-articles id))
-	   (total-articles (length article-ids)))
-      (if article-ids
+  (with-current-buffer nntp-server-buffer
+    (erase-buffer)
+    (setq group (nnttrss-decode-gnus-group group))
+    (if fast
+	t
+      (let* ((feed (cdr (assoc group nnttrss--feeds)))
+	     (id (plist-get feed :id))
+	     (article-ids (nnttrss--feed-articles id))
+	     (total-articles (length article-ids)))
+	(if article-ids
+	    (insert (format "211 %d %d %d \"%s\"\n"
+			    total-articles
+			    (apply 'min article-ids)
+			    (apply 'max article-ids)
+			    (nnttrss-encode-gnus-group group)))
 	  (insert (format "211 %d %d %d \"%s\"\n"
-			  total-articles
-			  (apply 'min article-ids)
-			  (apply 'max article-ids)
-			  (nnimap-encode-gnus-group group)))
-	(insert (format "211 %d %d %d \"%s\"\n"
-			total-articles 1 0
-			(nnimap-encode-gnus-group group)))))))
+			  total-articles 1 0
+			  (nnttrss-encode-gnus-group group))))
+	t))))
 
 (deffoo nnttrss-retrieve-headers (articles &optional group server fetch-old)
   (when group
@@ -184,7 +187,7 @@ lists of SQL IDs to article numbers.")
       (let ((start (point)))
 	(insert (plist-get article :content))
 	(w3m-region start (point)))))
-  (cons article buffer))
+  (cons group article))
 
 (deffoo nnttrss-close-group (group &optional server)
   t)
@@ -207,7 +210,8 @@ lists of SQL IDs to article numbers.")
   "Return headline NUMBER in GROUP formated in nov format."
   (let* ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
 	 (article-id (nnttrss--get-article-id number group-id))
-	 (article (nnttrss--find-article number group)))
+	 (article (nnttrss--find-article number group))
+	 (size (length (plist-get article :content))))
     (if article
 	(format "%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%S\n"
 		number
@@ -217,7 +221,7 @@ lists of SQL IDs to article numbers.")
 				    (seconds-to-time (plist-get article :updated)))
 		(format "<%d@%s.nnttrss>" article-id group-id)
 		""
-		-1
+		size
 		-1
 		""
 		nil))))
