@@ -178,21 +178,20 @@ lists of SQL IDs to article numbers.")
 	(article (nnttrss--find-article article group)))
     (with-current-buffer destination
       (erase-buffer)
-      (insert (format "Newgroups: %s\nSubject: %s\nFrom: %s\nDate: %s\n\n"
+      (insert (format "Newgroups: %s\nSubject: %s\nFrom: %s\nDate: %s\nMIME-Version: 1.0\nContent-Type: text/html; charset=utf-8\nContent-Transfer-Encoding: quoted-printable\n\n"
 		      group
 		      (plist-get article :title)
 		      (url-host (url-generic-parse-url (plist-get article :link)))
 		      (format-time-string "%a, %d %b %Y %T %z"
 					  (seconds-to-time (plist-get article :updated)))))
-      (let ((start (point)))
+      (let* ((start (point)))
 	(insert (plist-get article :content))
-	(w3m-region start (point)))))
+	(insert "\n\n"))))
   (cons group article))
 
 (deffoo nnttrss-close-group (group &optional server)
   t)
 
-
 ;;; Private bits
 
 (defun nnttrss--find-article (number group)
