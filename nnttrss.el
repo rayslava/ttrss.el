@@ -195,6 +195,9 @@ lists of SQL IDs to article numbers.")
 					  (seconds-to-time (plist-get article :updated)))))
       (let* ((start (point)))
 	(insert (plist-get article :content))
+	(insert (format "<p><a href=\"%s\">%s</a></p>"
+			(plist-get article :link)
+			(url-host (url-generic-parse-url (plist-get article :link)))))
 	(insert "\n\n"))))
   (cons group article))
 
