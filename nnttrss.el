@@ -162,13 +162,20 @@ lists of SQL IDs to article numbers.")
 			  (nnttrss-encode-gnus-group group))))
 	t))))
 
+;; (deffoo nnttrss-request-group-scan (group &optional server info)
+;;   (debug))
+
 (deffoo nnttrss-retrieve-headers (articles &optional group server fetch-old)
   (when group
     (setq group (nnttrss-decode-gnus-group group)))
   (with-current-buffer nntp-server-buffer
     (erase-buffer)
     (dolist (article articles)
-      (insert (nnttrss--format-header article group))))
+      (let* ((article-obj (nnttrss--find-article article group))
+	     (unread (plist-get article-obj :unread))
+	     (fetch (or fetch-old unread)))
+	(when fetch
+	  (insert (nnttrss--format-header article group))))))
   'nov)
 
 (deffoo nnttrss-request-article (article &optional group server to-buffer)
@@ -191,6 +198,32 @@ lists of SQL IDs to article numbers.")
 
 (deffoo nnttrss-close-group (group &optional server)
   t)
+
+(deffoo nnttrss-request-update-mark (group article mark)
+  "Update marks for ARTICLE in GROUP.
+
+Currently `unread' and `ticked' marks are supported, the latter
+one changes 'Starred' status in TT-RSS.
+Setting up an `unread' mark removes `ticked' as well."
+  (when group
+    (setq group (nnttrss-decode-gnus-group group)))
+  (let* ((article-id (nnttrss--get-article-id number group-id)))
+    (cond ((= mark gnus-read-mark)
+	   (ttrss-update-article nnttrss-address nnttrss--sid article-id
+				 :mode 0 :field 2))
+	  ((= mark gnus-unread-mark)               ;;; Untick and unmark
+	   (ttrss-update-article nnttrss-address nnttrss--sid article-id
+				 :mode 1 :field 2)
+	   (ttrss-update-article nnttrss-address nnttrss--sid article-id
+				 :mode 0 :field 0))
+	  ((= mark gnus-ticked-mark)
+	   (ttrss-update-article nnttrss-address nnttrss--sid article-id
+				 :mode 1 :field 0))
+	   (t (message "nnttrss: Unknown mark seting %s" mark)))
+    mark))
+
+(deffoo nnttrss-request-set-mark (group actions &optional server)
+  (debug))
 
 ;;; Private bits
 
