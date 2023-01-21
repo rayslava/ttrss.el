@@ -1,12 +1,14 @@
 ;;; nnttrss.el --- interfacing with Tiny Tiny RSS
 
 ;; Copyright (C) 2013 Pedro Silva
+;; Copyright (C) 2023 Slava Barinov
 
 ;; Author: Pedro Silva <psilva+git@pedrosilva.pt>
-;; Created: 01 April 2013
-;; Version: 0.0.1
+;;         Slava Barinov <rayslava@gmail.com>
+;; Created: 21 January 2023
+;; Version: 0.0.2
 ;; Keywords: news, local
-;; Package-Requires ((emacs "23.1"))
+;; Package-Requires ((emacs "28.2"))
 
 ;; This file is not part of GNU Emacs.
 
