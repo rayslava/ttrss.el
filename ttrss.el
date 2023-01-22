@@ -681,7 +681,10 @@ following key-value pairs:
 	 nil
 	 :op "updateArticle"
 	 :sid sid
-	 :article_ids article-ids
+	 :article_ids
+	 (if (listp article-ids)
+	     (s-join "," (mapcar #'number-to-string article-ids))
+	   article-ids)
 	 params))
 
 (defun ttrss-catchup-feed (address sid feed-id)

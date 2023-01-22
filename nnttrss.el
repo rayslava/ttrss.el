@@ -269,11 +269,11 @@ Setting up an `unread' mark removes `ticked' as well."
 	    (push article-id updatelist)))
 	(when (memq 'read marks)
 	  (ttrss-update-article nnttrss-address nnttrss--sid
-				(s-join "," (mapcar #'number-to-string updatelist))
+				updatelist
 				:mode unreadstate :field 2))
 	(when (memq 'tick marks)
 	  (ttrss-update-article nnttrss-address nnttrss--sid
-				(s-join "," (mapcar #'number-to-string updatelist))
+				updatelist
 				:mode tickedstate :field 0))))))
 
 ;;; Private bits
