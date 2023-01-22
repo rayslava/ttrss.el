@@ -662,9 +662,7 @@ property list's members are:
 					       article-ids
 					       ","))))
 
-
 ;;; Article manipulation
-
 (defun ttrss-update-article (address sid article-ids &rest params)
   "Update, at ADDRESS using SID, ARTICLE-IDS based on PARAMS.
 Returns number of articles updated.  PARAMS is any number of the
@@ -674,7 +672,7 @@ following key-value pairs:
     0: false, 1: true, 2: toggle.
 
 'field'
-    0: starred, 1: published, 2: unread, 3: article.
+    0: starred, 1: published, 2: unread, 3: article note
 
 'data'
     Optional data parameter when setting note field (string)."
@@ -685,8 +683,6 @@ following key-value pairs:
 	 :sid sid
 	 :article_ids article-ids
 	 params))
-
-
 
 (defun ttrss-catchup-feed (address sid feed-id)
   "Catchup, at ADDRESS using SID, FEED-ID.

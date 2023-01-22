@@ -212,8 +212,10 @@ one changes 'Starred' status in TT-RSS.
 Setting up an `unread' mark removes `ticked' as well."
   (when group
     (setq group (nnttrss-decode-gnus-group group)))
-  (let* ((article-id (nnttrss--get-article-id number group-id)))
-    (cond ((= mark gnus-read-mark)
+  (let* ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
+	 (article-id (nnttrss--get-article-id article group-id)))
+    (cond ((or (= mark gnus-read-mark)
+	       (= mark gnus-del-mark))
 	   (ttrss-update-article nnttrss-address nnttrss--sid article-id
 				 :mode 0 :field 2))
 	  ((= mark gnus-unread-mark)               ;;; Untick and unmark
@@ -224,13 +226,94 @@ Setting up an `unread' mark removes `ticked' as well."
 	  ((= mark gnus-ticked-mark)
 	   (ttrss-update-article nnttrss-address nnttrss--sid article-id
 				 :mode 1 :field 0))
-	   (t (message "nnttrss: Unknown mark seting %s" mark)))
+	  (t (message "nnttrss: Unknown mark seting %s" mark)))
     mark))
 
+(deffoo nnttrss-request-update-info  (group info &optional server)
+  "Update INFO for GROUP about marked and unread articles."
+  (when group
+    (setq group (nnttrss-decode-gnus-group group)))
+  (let* ((feed (cdr (assoc group nnttrss--feeds)))
+	 (id (plist-get feed :id))
+	 (article-ids (cl-sort (nnttrss--feed-articles id) #'<))
+	 (readart))
+    (nnttrss--update-articles-info group)
+    (setf (gnus-info-read info)
+	  (gnus-compress-sequence
+	   (nnttrss--get-filtered-articles group :unread nil)))
+    (setf (gnus-info-marks info)
+	  (list (cons 'tick
+		      (gnus-compress-sequence
+		       (nnttrss--get-filtered-articles group :marked t)))))))
+
 (deffoo nnttrss-request-set-mark (group actions &optional server)
-  (debug))
+  (dolist (action actions)
+    (let ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
+	  (updatelist nil)
+	  (unreadstate 0)
+	  (tickedstate 0))
+      (cl-destructuring-bind (range action marks) action
+	(when (and (memq 'tick marks)
+		   (eq action 'add))
+	  (push 'read marks))
+	(pcase action
+	  ('add (progn
+		  (setf unreadstate 0)
+		  (setf tickedstate 1)))
+	  ('del (progn
+		  (setf unreadstate 1)
+		  (setf tickedstate 0))))
+	(dolist (article (gnus-uncompress-sequence range))
+	  (let ((article-id (nnttrss--get-article-id article group-id)))
+	    (push article-id updatelist)))
+	(when (memq 'read marks)
+	  (ttrss-update-article nnttrss-address nnttrss--sid
+				(s-join "," (mapcar #'number-to-string updatelist))
+				:mode unreadstate :field 2))
+	(when (memq 'tick marks)
+	  (ttrss-update-article nnttrss-address nnttrss--sid
+				(s-join "," (mapcar #'number-to-string updatelist))
+				:mode tickedstate :field 0))))))
 
 ;;; Private bits
+
+(defun nnttrss--get-filtered-articles (group key value)
+  "Return list of articles in `GROUP' where `key' is eq to
+`value'."
+  (let* ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
+	 (articles (lax-plist-get nnttrss--article-map group-id)))
+    (cl-sort
+     (delq nil
+	   (mapcar (lambda (art)
+		     (when (eq
+			    (plist-get (cdr (assoc (car art) nnttrss--headlines)) key)
+			    value)
+		       (cdr art)))
+		   articles))
+     #'<)))
+
+(defun nnttrss--update-articles-info (group)
+  "Download information on articles from `GROUP' and merges changes
+into `nnttrss--headlines'"
+  (let* ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
+	 (articles (cl-sort (mapcar #'car
+				    (lax-plist-get nnttrss--article-map group-id))
+			    #'<))
+	 (headlines (ttrss-get-headlines
+		     nnttrss-address
+		     nnttrss--sid
+		     :feed_id group-id
+		     :limit -1
+		     :since_id (car articles))))
+    (mapc (lambda (art)
+	    (let* ((article-id (plist-get art :id))
+		   (article (alist-get article-id nnttrss--headlines)))
+	      (setf (plist-get article :unread) (plist-get art :unread))
+	      (setf (plist-get article :marked) (plist-get art :marked))
+	      (when (plist-get article :marked)
+		(message "Marked article: %s" article-id))
+	      ))
+	  headlines)))
 
 (defun nnttrss--find-article (number group)
   "Return property list for article NUMBER in GROUP."
