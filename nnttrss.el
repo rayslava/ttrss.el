@@ -5,7 +5,8 @@
 
 ;; Author: Pedro Silva <psilva+git@pedrosilva.pt>
 ;;         Slava Barinov <rayslava@gmail.com>
-;; Created: 21 January 2023
+;; Created: 01 April 2013
+;; Updated: 22 January 2023
 ;; Version: 0.0.2
 ;; Keywords: news, local
 ;; Package-Requires ((emacs "28.2"))
