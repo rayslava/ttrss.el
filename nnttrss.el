@@ -216,7 +216,8 @@ Setting up an `unread' mark removes `ticked' as well."
   (let* ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
 	 (article-id (nnttrss--get-article-id article group-id)))
     (cond ((or (= mark gnus-read-mark)
-	       (= mark gnus-del-mark))
+	       (= mark gnus-del-mark)
+	       (= mark gnus-catchup-mark))
 	   (ttrss-update-article nnttrss-address nnttrss--sid article-id
 				 :mode 0 :field 2))
 	  ((= mark gnus-unread-mark)               ;;; Untick and unmark
