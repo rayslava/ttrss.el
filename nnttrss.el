@@ -30,6 +30,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'ttrss)
 (require 'gnus)
 (require 'nnoo)
@@ -102,6 +103,33 @@ Set to nil to disable automatic syncing."
                  (const :tag "Disabled" nil))
   :group 'nnttrss)
 
+(defcustom nnttrss-cache-full-content t
+  "If non-nil, cache full article content during background sync.
+This makes opening articles instant but increases cache file size."
+  :type 'boolean
+  :group 'nnttrss)
+
+(defcustom nnttrss-content-fetch-batch-size 50
+  "Number of articles to fetch content for in each batch during sync."
+  :type 'integer
+  :group 'nnttrss)
+
+(defcustom nnttrss-cache-max-age 90
+  "Maximum age in days for cached articles.
+Articles older than this are removed during cleanup.
+Set to nil to disable age-based cleanup."
+  :type '(choice (integer :tag "Days")
+                 (const :tag "Unlimited" nil))
+  :group 'nnttrss)
+
+(defcustom nnttrss-cache-max-articles-per-feed 500
+  "Maximum number of articles to keep per feed.
+Oldest articles are removed when this limit is exceeded.
+Set to nil to disable size-based cleanup."
+  :type '(choice (integer :tag "Max articles")
+                 (const :tag "Unlimited" nil))
+  :group 'nnttrss)
+
 (defvar nnttrss--sync-timer nil
   "Timer for background sync.")
 
@@ -145,7 +173,8 @@ Set to nil to disable automatic syncing."
 	  nnttrss--headlines nil
 	  nnttrss--article-map nil
 	  nnttrss--last-article-id 0
-	  nnttrss--sync-in-progress nil)))
+	  nnttrss--sync-in-progress nil
+	  nnttrss--pending-content-ids nil)))
 
 (deffoo nnttrss-request-close ()
   t)
@@ -610,7 +639,72 @@ Updates local cache without blocking Emacs."
       (let ((article (cdr entry)))
         (plist-put article :marked (gethash (plist-get article :id) marked-set)))))
   (nnttrss--write-headlines)
-  (setq nnttrss--sync-in-progress nil)
+  ;; Step 6: Fetch missing article content if enabled
+  (if nnttrss-cache-full-content
+      (nnttrss--sync-fetch-missing-content)
+    (nnttrss--sync-complete)))
+
+(defun nnttrss--sync-fetch-missing-content ()
+  "Fetch content for articles that don't have it cached."
+  (let ((missing-ids '()))
+    ;; Find articles without content
+    (dolist (entry nnttrss--headlines)
+      (let ((article (cdr entry)))
+        (unless (plist-get article :content)
+          (push (plist-get article :id) missing-ids))))
+    (if missing-ids
+        (progn
+          (message "nnttrss: Fetching content for %d articles..." (length missing-ids))
+          ;; Store the list for batch processing
+          (setq nnttrss--pending-content-ids (nreverse missing-ids))
+          (nnttrss--fetch-content-batch))
+      (nnttrss--sync-complete))))
+
+(defvar nnttrss--pending-content-ids nil
+  "List of article IDs still needing content fetch.")
+
+(defun nnttrss--fetch-content-batch ()
+  "Fetch content for a batch of articles."
+  (if (null nnttrss--pending-content-ids)
+      (nnttrss--sync-complete)
+    ;; Take a batch
+    (let ((batch '())
+          (count 0))
+      (while (and nnttrss--pending-content-ids
+                  (< count nnttrss-content-fetch-batch-size))
+        (push (pop nnttrss--pending-content-ids) batch)
+        (cl-incf count))
+      ;; Fetch this batch
+      (apply #'ttrss-get-article-async
+             nnttrss-address
+             nnttrss--sid
+             #'nnttrss--sync-content-callback
+             #'nnttrss--sync-error-callback
+             (nreverse batch)))))
+
+(defun nnttrss--sync-content-callback (articles)
+  "Callback for article content fetch. ARTICLES is list of article plists."
+  (dolist (article articles)
+    (let* ((id (plist-get article :id))
+           (entry (assoc id nnttrss--headlines)))
+      (when entry
+        (plist-put (cdr entry) :content (plist-get article :content)))))
+  ;; Continue with next batch or finish
+  (if nnttrss--pending-content-ids
+      (progn
+        (message "nnttrss: %d articles remaining..."
+                 (length nnttrss--pending-content-ids))
+        (nnttrss--fetch-content-batch))
+    (nnttrss--write-headlines)
+    (nnttrss--sync-complete)))
+
+(defun nnttrss--sync-complete ()
+  "Finalize sync and report completion."
+  (setq nnttrss--sync-in-progress nil
+        nnttrss--pending-content-ids nil)
+  ;; Run cache cleanup if configured
+  (when (or nnttrss-cache-max-age nnttrss-cache-max-articles-per-feed)
+    (nnttrss--cleanup-cache))
   (message "nnttrss: Sync complete (%d feeds, %d articles)"
            (length nnttrss--feeds)
            (length nnttrss--headlines)))
@@ -618,7 +712,8 @@ Updates local cache without blocking Emacs."
 (defun nnttrss--sync-error-callback (error-msg)
   "Callback for sync errors.  ERROR-MSG is the error description.
 Attempts re-login if session expired."
-  (setq nnttrss--sync-in-progress nil)
+  (setq nnttrss--sync-in-progress nil
+        nnttrss--pending-content-ids nil)
   (if (string-match-p "not logged in\\|login\\|session" (downcase error-msg))
       (progn
         (message "nnttrss: Session expired, re-logging in...")
@@ -642,6 +737,101 @@ After sync completes, press `g' in the Group buffer to see updates."
     (if nnttrss--sid
         (nnttrss--sync-async)
       (message "nnttrss: Not connected to server"))))
+
+;;; Cache cleanup
+
+(defun nnttrss--cleanup-cache ()
+  "Clean up old and excess articles from cache.
+Removes articles based on `nnttrss-cache-max-age' and
+`nnttrss-cache-max-articles-per-feed' settings."
+  (let ((removed-age 0)
+        (removed-size 0))
+    ;; Age-based cleanup
+    (when nnttrss-cache-max-age
+      (let ((cutoff-time (- (float-time) (* nnttrss-cache-max-age 24 60 60))))
+        (setq removed-age (nnttrss--cleanup-by-age cutoff-time))))
+    ;; Size-based cleanup (per feed)
+    (when nnttrss-cache-max-articles-per-feed
+      (setq removed-size (nnttrss--cleanup-by-size)))
+    ;; Update article map to remove stale references
+    (when (> (+ removed-age removed-size) 0)
+      (nnttrss--cleanup-article-map)
+      (nnttrss--write-headlines)
+      (nnttrss--write-article-map)
+      (message "nnttrss: Cleanup removed %d old + %d excess articles"
+               removed-age removed-size))))
+
+(defun nnttrss--cleanup-by-age (cutoff-time)
+  "Remove articles older than CUTOFF-TIME. Return count removed."
+  (let ((removed 0)
+        (new-headlines '()))
+    (dolist (entry nnttrss--headlines)
+      (let* ((article (cdr entry))
+             (updated (plist-get article :updated)))
+        (if (and updated (< updated cutoff-time))
+            (cl-incf removed)
+          (push entry new-headlines))))
+    (setq nnttrss--headlines (nreverse new-headlines))
+    removed))
+
+(defun nnttrss--cleanup-by-size ()
+  "Remove excess articles per feed. Return count removed."
+  (let ((removed 0)
+        (feed-articles (make-hash-table :test 'eq)))
+    ;; Group articles by feed
+    (dolist (entry nnttrss--headlines)
+      (let* ((article (cdr entry))
+             (feed-id (plist-get article :feed_id)))
+        (puthash feed-id
+                 (cons entry (gethash feed-id feed-articles))
+                 feed-articles)))
+    ;; Keep only newest N per feed
+    (let ((new-headlines '()))
+      (maphash
+       (lambda (feed-id articles)
+         ;; Sort by updated time (newest first)
+         (let ((sorted (sort articles
+                             (lambda (a b)
+                               (> (or (plist-get (cdr a) :updated) 0)
+                                  (or (plist-get (cdr b) :updated) 0))))))
+           ;; Keep only max articles
+           (let ((count 0))
+             (dolist (entry sorted)
+               (if (< count nnttrss-cache-max-articles-per-feed)
+                   (progn
+                     (push entry new-headlines)
+                     (cl-incf count))
+                 (cl-incf removed))))))
+       feed-articles)
+      (setq nnttrss--headlines new-headlines))
+    removed))
+
+(defun nnttrss--cleanup-article-map ()
+  "Remove article map entries for articles no longer in headlines."
+  (let ((valid-ids (make-hash-table :test 'eq)))
+    ;; Build set of valid article IDs
+    (dolist (entry nnttrss--headlines)
+      (puthash (car entry) t valid-ids))
+    ;; Filter article map
+    (let ((new-map '()))
+      (cl-loop for (feed-id mappings) on nnttrss--article-map by #'cddr
+               do (let ((valid-mappings
+                         (cl-remove-if-not
+                          (lambda (m) (gethash (car m) valid-ids))
+                          mappings)))
+                    (when valid-mappings
+                      (setq new-map (plist-put new-map feed-id valid-mappings)))))
+      (setq nnttrss--article-map new-map))))
+
+;;;###autoload
+(defun nnttrss-cleanup-cache ()
+  "Manually trigger cache cleanup.
+Removes old articles and excess articles per feed based on
+`nnttrss-cache-max-age' and `nnttrss-cache-max-articles-per-feed'."
+  (interactive)
+  (if (or nnttrss-cache-max-age nnttrss-cache-max-articles-per-feed)
+      (nnttrss--cleanup-cache)
+    (message "nnttrss: No cleanup limits configured")))
 
 (provide 'nnttrss)
 ;;; nnttrss.el ends here

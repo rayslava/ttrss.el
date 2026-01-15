@@ -643,6 +643,19 @@ PARAMS is any number of the following key-value pairs:
 	 :sid sid
 	 params))
 
+(defun ttrss-get-article-async (address sid callback &optional error-callback &rest article-ids)
+  "Async version of `ttrss-get-article'. Calls CALLBACK with article list."
+  (when article-ids
+    (ttrss-post-request-async
+     address
+     callback
+     error-callback
+     :op "getArticle"
+     :sid sid
+     :article_id (mapconcat (lambda (i) (format "%d" i))
+                            article-ids
+                            ","))))
+
 (defun ttrss-get-article (address sid &rest article-ids)
   "Return article property list from ADDRESS using SID with ARTICLE-IDS.
 Returns nil or an empty list if those IDs can't be found.  The
