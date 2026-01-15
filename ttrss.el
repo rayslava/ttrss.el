@@ -728,6 +728,22 @@ property list's members are:
 					       ","))))
 
 ;;; Article manipulation
+(defun ttrss-update-article-async (address sid article-ids callback &optional error-callback &rest params)
+  "Async version of `ttrss-update-article'. Calls CALLBACK with result.
+ARTICLE-IDS can be a single ID or list of IDs.
+PARAMS are :mode and :field as in `ttrss-update-article'."
+  (apply #'ttrss-post-request-async
+         address
+         callback
+         error-callback
+         :op "updateArticle"
+         :sid sid
+         :article_ids
+         (if (listp article-ids)
+             (mapconcat #'number-to-string article-ids ",")
+           (number-to-string article-ids))
+         params))
+
 (defun ttrss-update-article (address sid article-ids &rest params)
   "Update, at ADDRESS using SID, ARTICLE-IDS based on PARAMS.
 Returns number of articles updated.  PARAMS is any number of the
