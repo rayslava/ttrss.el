@@ -1,4 +1,4 @@
-;;; nnttrss.el --- interfacing with Tiny Tiny RSS
+;;; nnttrss.el --- interfacing with Tiny Tiny RSS  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2013 Pedro Silva
 ;; Copyright (C) 2023 Slava Barinov
@@ -38,9 +38,16 @@
 (require 'nnheader)
 (require 'mm-util)
 
+;; Declare dynamic variables from gnus
+(defvar gnus-read-mark)
+(defvar gnus-del-mark)
+(defvar gnus-catchup-mark)
+(defvar gnus-unread-mark)
+(defvar gnus-ticked-mark)
+
 (nnoo-declare nnttrss)
 (nnoo-define-basics nnttrss)
-(gnus-declare-backend "nnttrss" 'news 'address)
+(gnus-declare-backend "nnttrss" 'news 'address 'agent)
 
 (defvoo nnttrss-address nil
   "Address of the tt-rss server.")
@@ -82,6 +89,25 @@ lists of SQL IDs to article numbers.")
 (defvar nnttrss--feeds nil
   "List of all feed property lists.")
 
+;;; Async sync configuration
+
+(defgroup nnttrss nil
+  "Gnus backend for Tiny Tiny RSS."
+  :group 'gnus)
+
+(defcustom nnttrss-sync-interval 300
+  "Seconds between automatic background syncs.
+Set to nil to disable automatic syncing."
+  :type '(choice (integer :tag "Seconds")
+                 (const :tag "Disabled" nil))
+  :group 'nnttrss)
+
+(defvar nnttrss--sync-timer nil
+  "Timer for background sync.")
+
+(defvar nnttrss--sync-in-progress nil
+  "Non-nil when async sync is running.")
+
 
 ;;; Interface bits
 (defun nnttrss-decode-gnus-group (group)
@@ -91,8 +117,7 @@ lists of SQL IDs to article numbers.")
   (encode-coding-string group 'utf-8))
 
 (deffoo nnttrss-open-server (server &optional defs)
-  (if (nnttrss-server-opened server)
-      t
+  (unless (nnttrss-server-opened server)
     (dolist (def '(nnttrss-address nnttrss-user nnttrss-password))
       (unless (assq def defs)
 	(setq defs (append defs (list (list def server)))))
@@ -104,10 +129,14 @@ lists of SQL IDs to article numbers.")
       (setq nnttrss--sid sid
 	    nnttrss--server-version (ttrss-get-version nnttrss-address nnttrss--sid)
 	    nnttrss--api-level (ttrss-get-api-level nnttrss-address nnttrss--sid))))
+  (unless nnttrss--sync-timer
+    (nnttrss--start-sync-timer)
+    (nnttrss--sync-async))
   (nnoo-change-server 'nnttrss server defs))
 
 (deffoo nnttrss-close-server (&optional server)
   (when (nnttrss-server-opened server)
+    (nnttrss--stop-sync-timer)
     (ttrss-logout nnttrss-address nnttrss--sid)
     (setq nnttrss--sid nil
 	  nnttrss--server-version nil
@@ -115,20 +144,22 @@ lists of SQL IDs to article numbers.")
 	  nnttrss--feeds nil
 	  nnttrss--headlines nil
 	  nnttrss--article-map nil
-	  nnttrss--last-article-id 0)))
+	  nnttrss--last-article-id 0
+	  nnttrss--sync-in-progress nil)))
 
 (deffoo nnttrss-request-close ()
   t)
 
 (deffoo nnttrss-server-opened (&optional server)
-  (and nnttrss--sid (ttrss-logged-in-p nnttrss-address nnttrss--sid)))
+  "Check if server is opened.  Non-blocking (checks local state only).
+Session validity is verified during background sync."
+  (and nnttrss--sid t))
 
 (deffoo nnttrss-request-list (&optional server)
+  "Return list of feeds from cache.  Non-blocking.
+Use `nnttrss-sync' to refresh from server."
   (with-current-buffer nntp-server-buffer
     (erase-buffer)
-    (nnttrss--update-feeds)
-    (nnttrss--update-headlines)
-    (nnttrss--update-article-map)
     (dolist (feed (mapcar 'cdr nnttrss--feeds))
       (let* ((title (plist-get feed :title))
 	     (id (plist-get feed :id))
@@ -232,14 +263,12 @@ Setting up an `unread' mark removes `ticked' as well."
     mark))
 
 (deffoo nnttrss-request-update-info  (group info &optional server)
-  "Update INFO for GROUP about marked and unread articles."
+  "Update INFO for GROUP about marked and unread articles.
+Reads from cache only - use `nnttrss-sync' to refresh from server."
   (when group
     (setq group (nnttrss-decode-gnus-group group)))
   (let* ((feed (cdr (assoc group nnttrss--feeds)))
-	 (id (plist-get feed :id))
-	 (article-ids (cl-sort (nnttrss--feed-articles id) #'<))
-	 (readart))
-    (nnttrss--update-articles-info group)
+	 (id (plist-get feed :id)))
     (setf (gnus-info-read info)
 	  (gnus-compress-sequence
 	   (nnttrss--get-filtered-articles group :unread nil)))
@@ -280,8 +309,7 @@ Setting up an `unread' mark removes `ticked' as well."
 ;;; Private bits
 
 (defun nnttrss--get-filtered-articles (group key value)
-  "Return list of articles in `GROUP' where `key' is eq to
-`value'."
+  "Return list of articles in `GROUP' where `KEY' is eq to `VALUE'."
   (let* ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
 	 (articles (lax-plist-get nnttrss--article-map group-id)))
     (cl-sort
@@ -295,8 +323,8 @@ Setting up an `unread' mark removes `ticked' as well."
      #'<)))
 
 (defun nnttrss--update-articles-info (group)
-  "Download information on articles from `GROUP' and merges changes
-into `nnttrss--headlines'"
+  "Download information on articles from `GROUP' and merges changes into
+`nnttrss--headlines'"
   (let* ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
 	 (articles (cl-sort (mapcar #'car
 				    (lax-plist-get nnttrss--article-map group-id))
@@ -491,6 +519,129 @@ Assumes the variable 'nnttrss--headlines' is set."
 					       (cons (plist-get h :id) h))
 					     headlines))))
   (nnttrss--write-headlines))
+
+;;; Async machinery
+
+(defun nnttrss--start-sync-timer ()
+  "Start the background sync timer if `nnttrss-sync-interval' is set."
+  (nnttrss--stop-sync-timer)
+  (when nnttrss-sync-interval
+    (setq nnttrss--sync-timer
+          (run-with-timer nnttrss-sync-interval
+                          nnttrss-sync-interval
+                          #'nnttrss--sync-async))))
+
+(defun nnttrss--stop-sync-timer ()
+  "Stop the background sync timer."
+  (when nnttrss--sync-timer
+    (cancel-timer nnttrss--sync-timer)
+    (setq nnttrss--sync-timer nil)))
+
+(defun nnttrss--sync-async ()
+  "Asynchronously sync feeds and headlines from server.
+Updates local cache without blocking Emacs."
+  (when (and nnttrss--sid (not nnttrss--sync-in-progress))
+    (setq nnttrss--sync-in-progress t)
+    (message "nnttrss: Syncing feeds...")
+    (ttrss-get-feeds-async
+     nnttrss-address
+     nnttrss--sid
+     #'nnttrss--sync-feeds-callback
+     #'nnttrss--sync-error-callback
+     :include_nested t
+     :cat_id -4)))
+
+(defun nnttrss--sync-feeds-callback (feeds)
+  "Callback for async feeds fetch. FEEDS is the list of feed plists."
+  (setq nnttrss--feeds (mapcar (lambda (f) (cons (plist-get f :title) f))
+                               feeds))
+  (nnttrss--write-feeds)
+  (ttrss-get-headlines-async
+   nnttrss-address
+   nnttrss--sid
+   #'nnttrss--sync-headlines-callback
+   #'nnttrss--sync-error-callback
+   :feed_id -4
+   :limit -1
+   :since_id nnttrss--last-article-id
+   :show_content (not nnttrss-fetch-partial-articles)))
+
+(defun nnttrss--sync-headlines-callback (headlines)
+  "Callback for async headlines fetch. HEADLINES is the list of headline plists."
+  (setq nnttrss--headlines (append nnttrss--headlines
+                                   (mapcar (lambda (h)
+                                             (cons (plist-get h :id) h))
+                                           headlines)))
+  (nnttrss--write-headlines)
+  (nnttrss--update-article-map)
+  (message "nnttrss: Updating marks...")
+  (ttrss-get-headlines-async
+   nnttrss-address
+   nnttrss--sid
+   #'nnttrss--sync-unread-callback
+   #'nnttrss--sync-error-callback
+   :feed_id -4
+   :view_mode "unread"
+   :limit -1))
+
+(defun nnttrss--sync-unread-callback (unread-headlines)
+  "Callback for unread articles fetch.  Updates unread marks in cache."
+  (let ((unread-set (make-hash-table :test 'eq)))
+    (dolist (h unread-headlines)
+      (puthash (plist-get h :id) t unread-set))
+    (dolist (entry nnttrss--headlines)
+      (let ((article (cdr entry)))
+        (plist-put article :unread (gethash (plist-get article :id) unread-set)))))
+  (ttrss-get-headlines-async
+   nnttrss-address
+   nnttrss--sid
+   #'nnttrss--sync-marked-callback
+   #'nnttrss--sync-error-callback
+   :feed_id -4
+   :view_mode "marked"
+   :limit -1))
+
+(defun nnttrss--sync-marked-callback (marked-headlines)
+  "Callback for marked articles fetch.  Updates starred marks in cache."
+  (let ((marked-set (make-hash-table :test 'eq)))
+    (dolist (h marked-headlines)
+      (puthash (plist-get h :id) t marked-set))
+    (dolist (entry nnttrss--headlines)
+      (let ((article (cdr entry)))
+        (plist-put article :marked (gethash (plist-get article :id) marked-set)))))
+  (nnttrss--write-headlines)
+  (setq nnttrss--sync-in-progress nil)
+  (message "nnttrss: Sync complete (%d feeds, %d articles)"
+           (length nnttrss--feeds)
+           (length nnttrss--headlines)))
+
+(defun nnttrss--sync-error-callback (error-msg)
+  "Callback for sync errors.  ERROR-MSG is the error description.
+Attempts re-login if session expired."
+  (setq nnttrss--sync-in-progress nil)
+  (if (string-match-p "not logged in\\|login\\|session" (downcase error-msg))
+      (progn
+        (message "nnttrss: Session expired, re-logging in...")
+        (condition-case err
+            (let ((sid (ttrss-login nnttrss-address nnttrss-user nnttrss-password)))
+              (setq nnttrss--sid sid)
+              (message "nnttrss: Re-login successful, retrying sync...")
+              (nnttrss--sync-async))
+          (error
+           (message "nnttrss: Re-login failed - %s" (error-message-string err)))))
+    (message "nnttrss: Sync failed - %s" error-msg)))
+
+;;;###autoload
+(defun nnttrss-sync ()
+  "Manually trigger an asynchronous sync from TT-RSS server.
+Updates feeds and headlines in the background without blocking Emacs.
+After sync completes, press `g' in the Group buffer to see updates."
+  (interactive)
+  (if nnttrss--sync-in-progress
+      (message "nnttrss: Sync already in progress")
+    (if nnttrss--sid
+        (nnttrss--sync-async)
+      (message "nnttrss: Not connected to server"))))
 
 (provide 'nnttrss)
 ;;; nnttrss.el ends here

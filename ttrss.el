@@ -1,4 +1,4 @@
-;;; ttrss.el --- Tiny Tiny RSS elisp bindings
+;;; ttrss.el --- Tiny Tiny RSS elisp bindings  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2013 Pedro Silva
 
@@ -108,6 +108,13 @@
   (autoload 'json-read "json")
   (autoload 'json-encode "json"))
 
+;; Declare dynamic variables from url and json libraries
+(defvar url-request-method)
+(defvar url-request-data)
+(defvar json-object-type)
+(defvar json-array-type)
+(defvar json-false)
+
 (defgroup ttrss nil
   "Tiny Tiny RSS elisp bindings"
   :group 'external
@@ -164,6 +171,32 @@ with 'ttrss-parse-request' as a callback."
 	(url-request-data (json-encode content)))
     (url-retrieve address 'ttrss-parse-request)))
 
+(defun ttrss-post-request-async (address callback &optional error-callback &rest content)
+  "Post CONTENT to ADDRESS asynchronously, call CALLBACK with result.
+CALLBACK is called with parsed JSON response (plist) on success.
+ERROR-CALLBACK is called with error message string on failure.
+If ERROR-CALLBACK is nil, errors are reported via `message'."
+  (let ((url-request-method "POST")
+        (url-request-data (json-encode content)))
+    (url-retrieve
+     address
+     (lambda (status callback error-callback)
+       (if-let ((err (plist-get status :error)))
+           (let ((msg (format "Network error: %s" (cdr err))))
+             (if error-callback
+                 (funcall error-callback msg)
+               (message "ttrss: %s" msg)))
+         (condition-case err
+             (let ((result (ttrss-parse-request nil)))
+               (funcall callback result))
+           (error
+            (let ((msg (format "Parse error: %s" (error-message-string err))))
+              (if error-callback
+                  (funcall error-callback msg)
+                (message "ttrss: %s" msg)))))))
+     (list callback error-callback)
+     t)))
+
 (defun ttrss-parse-request (url-status &rest property)
   "Parse a url response buffer with URL-STATUS.
 Return a property list of the response, or, optionally, the
@@ -185,7 +218,6 @@ PROPERTY value of said property list."
 	  (message "API status OK")
 	  value)))))
 
-
 ;;; Session management
 
 (defun ttrss-login (address user password)
@@ -392,6 +424,16 @@ The default is \"flc\".  The property list members are:
 		      :op "getCounters"
 		      :sid sid))
 
+(defun ttrss-get-feeds-async (address sid callback &optional error-callback &rest params)
+  "Async version of `ttrss-get-feeds'. Calls CALLBACK with feed list."
+  (apply #'ttrss-post-request-async
+         address
+         callback
+         error-callback
+         :op "getFeeds"
+         :sid sid
+         params))
+
 (defun ttrss-get-feeds (address sid &rest params)
   "Return a list of property lists of feeds at ADDRESS using SID.
 PARAMS is any number of the following property-value pairs:
@@ -527,6 +569,16 @@ of articles updated."
 
 
 ;;; Article listings
+
+(defun ttrss-get-headlines-async (address sid callback &optional error-callback &rest params)
+  "Async version of `ttrss-get-headlines'. Calls CALLBACK with headlines list."
+  (apply #'ttrss-post-request-async
+         address
+         callback
+         error-callback
+         :op "getHeadlines"
+         :sid sid
+         params))
 
 (defun ttrss-get-headlines (address sid &rest params)
   "Return a list of headline plists at ADDRESS using SID.
