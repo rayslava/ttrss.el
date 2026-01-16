@@ -1,15 +1,16 @@
-;;; nnttrss.el --- interfacing with Tiny Tiny RSS  -*- lexical-binding: t; -*-
+;;; nnttrss.el --- Gnus backend for Tiny Tiny RSS  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2013 Pedro Silva
-;; Copyright (C) 2023 Slava Barinov
+;; Copyright (C) 2023-2025 Slava Barinov
 
 ;; Author: Pedro Silva <psilva+git@pedrosilva.pt>
-;;         Slava Barinov <rayslava@gmail.com>
+;;         Slava Barinov <rayslava@rayslava.com>
 ;; Created: 01 April 2013
-;; Updated: 22 January 2023
-;; Version: 0.0.2
-;; Keywords: news, local
-;; Package-Requires ((emacs "28.2"))
+;; Updated: 16 January 2025
+;; Version: 0.1.0
+;; Keywords: news, rss, gnus
+;; Package-Requires: ((emacs "29.1"))
+;; URL: https://github.com/rayslava/ttrss.el
 
 ;; This file is not part of GNU Emacs.
 
@@ -28,16 +29,36 @@
 
 ;;; Commentary:
 
+;; This package provides a Gnus backend for reading feeds from a
+;; Tiny Tiny RSS server.  It uses file-per-article storage similar
+;; to Gnus Agent and performs background async synchronization.
+;;
+;; Usage:
+;;
+;;   (setq gnus-select-method
+;;         '(nnttrss "default"
+;;           (nnttrss-address "https://example.com/tt-rss/api/")
+;;           (nnttrss-user "username")
+;;           (nnttrss-password "password")))
+;;
+;; Or add as a secondary method:
+;;
+;;   (add-to-list 'gnus-secondary-select-methods
+;;                '(nnttrss "myserver"
+;;                  (nnttrss-address "https://example.com/tt-rss/api/")
+;;                  (nnttrss-user "username")
+;;                  (nnttrss-password "password")))
+
 ;;; Code:
 
 (require 'cl-lib)
+(require 'range)
 (require 'ttrss)
+(require 'nnttrss-storage)
+(require 'nnttrss-sync)
 (require 'gnus)
 (require 'nnoo)
-(require 'nnmail)
-(require 'nnrss)
 (require 'nnheader)
-(require 'mm-util)
 
 ;; Declare dynamic variables from gnus
 (defvar gnus-read-mark)
@@ -46,901 +67,318 @@
 (defvar gnus-unread-mark)
 (defvar gnus-ticked-mark)
 
+;;; Backend declaration
+
 (nnoo-declare nnttrss)
 (nnoo-define-basics nnttrss)
 (gnus-declare-backend "nnttrss" 'news 'address 'agent)
 
+;;; Server variables
+
 (defvoo nnttrss-address nil
-  "Address of the tt-rss server.")
+  "Address of the TT-RSS API endpoint.")
 
 (defvoo nnttrss-user nil
-  "Username to use for authentication to the tt-rss server.")
+  "Username for TT-RSS authentication.")
 
 (defvoo nnttrss-password nil
-  "Password to use for authentication to the tt-rss server.")
+  "Password for TT-RSS authentication.")
 
-(defvoo nnttrss-directory (nnheader-concat gnus-directory "ttrss/")
-  "Where nnttrss will save its files.")
+(defvoo nnttrss-status-string ""
+  "Last status message.")
 
-(defvoo nnttrss-fetch-partial-articles nil
-  "If non-nil, nnttrss will fetch partial articles.")
+;;; Internal state (per-server)
 
-(defvoo nnttrss-status-string "")
+(defvar nnttrss--sessions (make-hash-table :test 'equal)
+  "Hash table of server -> session info plist.
+Each plist contains :sid, :address, :user.")
 
-(defvar nnttrss--sid nil
-  "Current session id, if any, set after successful login.")
+;;; Helper functions
 
-(defvar nnttrss--api-level nil
-  "API version level, increased with each API functionality change.")
+(defun nnttrss--server-key (server)
+  "Return normalized key for SERVER."
+  (or server "default"))
 
-(defvar nnttrss--server-version nil
-  "Server version number.")
+(defun nnttrss--get-session (server)
+  "Get session info for SERVER."
+  (gethash (nnttrss--server-key server) nnttrss--sessions))
 
-(defvar nnttrss--headlines nil
-  "List of all headline propertly lists.")
+(defun nnttrss--set-session (server info)
+  "Set session INFO for SERVER."
+  (puthash (nnttrss--server-key server) info nnttrss--sessions))
 
-(defvar nnttrss--last-article-id 0
-  "Internal server ID of last article nnttrss knows about.")
+(defun nnttrss--clear-session (server)
+  "Clear session for SERVER."
+  (remhash (nnttrss--server-key server) nnttrss--sessions))
 
-(defvar nnttrss--article-map nil
-  "Property list of association lists.
-The properties are group name strings.  Values are association
-lists of SQL IDs to article numbers.")
-
-(defvar nnttrss--feeds nil
-  "List of all feed property lists.")
-
-;;; Async sync configuration
-
-(defgroup nnttrss nil
-  "Gnus backend for Tiny Tiny RSS."
-  :group 'gnus)
-
-(defcustom nnttrss-sync-interval 300
-  "Seconds between automatic background syncs.
-Set to nil to disable automatic syncing."
-  :type '(choice (integer :tag "Seconds")
-                 (const :tag "Disabled" nil))
-  :group 'nnttrss)
-
-(defcustom nnttrss-cache-full-content t
-  "If non-nil, cache full article content during background sync.
-This makes opening articles instant but increases cache file size."
-  :type 'boolean
-  :group 'nnttrss)
-
-(defcustom nnttrss-content-fetch-batch-size 50
-  "Number of articles to fetch content for in each batch during sync."
-  :type 'integer
-  :group 'nnttrss)
-
-(defcustom nnttrss-cache-max-age 90
-  "Maximum age in days for cached articles.
-Articles older than this are removed during cleanup.
-Set to nil to disable age-based cleanup."
-  :type '(choice (integer :tag "Days")
-                 (const :tag "Unlimited" nil))
-  :group 'nnttrss)
-
-(defcustom nnttrss-cache-max-articles-per-feed 500
-  "Maximum number of articles to keep per feed.
-Oldest articles are removed when this limit is exceeded.
-Set to nil to disable size-based cleanup."
-  :type '(choice (integer :tag "Max articles")
-                 (const :tag "Unlimited" nil))
-  :group 'nnttrss)
-
-(defvar nnttrss--sync-timer nil
-  "Timer for background sync.")
-
-(defvar nnttrss--sync-in-progress nil
-  "Non-nil when async sync is running.")
-
-(defvar nnttrss--pending-mark-updates nil
-  "Queue of pending mark updates to sync to server.
-Each entry is a plist with :article-id, :field (0=starred, 2=unread), :mode (0/1).")
-
-
-;;; Interface bits
 (defun nnttrss-decode-gnus-group (group)
+  "Decode GROUP name from Gnus internal encoding."
   (decode-coding-string group 'utf-8))
 
 (defun nnttrss-encode-gnus-group (group)
+  "Encode GROUP name for Gnus internal use."
   (encode-coding-string group 'utf-8))
 
+;;; Server operations
+
 (deffoo nnttrss-open-server (server &optional defs)
+  "Open connection to TT-RSS SERVER with DEFS configuration."
   (unless (nnttrss-server-opened server)
+    ;; Extract configuration from defs
     (dolist (def '(nnttrss-address nnttrss-user nnttrss-password))
       (unless (assq def defs)
-	(setq defs (append defs (list (list def server)))))
+        (setq defs (append defs (list (list def server)))))
       (setf (symbol-value def) (cadr (assq def defs))))
-    (nnttrss--read-feeds)
-    (nnttrss--read-headlines)
-    (nnttrss--read-article-map)
-    (let ((sid (ttrss-login nnttrss-address nnttrss-user nnttrss-password)))
-      (setq nnttrss--sid sid
-	    nnttrss--server-version (ttrss-get-version nnttrss-address nnttrss--sid)
-	    nnttrss--api-level (ttrss-get-api-level nnttrss-address nnttrss--sid))))
-  (unless nnttrss--sync-timer
-    (nnttrss--start-sync-timer)
-    (nnttrss--sync-async))
+    ;; Login to server
+    (condition-case err
+        (let ((sid (ttrss-login nnttrss-address nnttrss-user nnttrss-password)))
+          (nnttrss--set-session server
+                                (list :sid sid
+                                      :address nnttrss-address
+                                      :user nnttrss-user))
+          ;; Initialize storage
+          (nnttrss-storage-init (nnttrss--server-key server))
+          ;; Start sync timer and trigger initial sync
+          (nnttrss-sync-start-timer (nnttrss--server-key server)
+                                    nnttrss-address sid)
+          (when nnttrss-sync-on-open
+            (nnttrss-sync (nnttrss--server-key server) nnttrss-address sid)))
+      (error
+       (setq nnttrss-status-string (error-message-string err))
+       nil)))
   (nnoo-change-server 'nnttrss server defs))
 
-(deffoo nnttrss-close-server (&optional server)
-  (when (nnttrss-server-opened server)
-    (nnttrss--stop-sync-timer)
-    (ttrss-logout nnttrss-address nnttrss--sid)
-    (setq nnttrss--sid nil
-	  nnttrss--server-version nil
-	  nnttrss--api-level nil
-	  nnttrss--feeds nil
-	  nnttrss--headlines nil
-	  nnttrss--article-map nil
-	  nnttrss--last-article-id 0
-	  nnttrss--sync-in-progress nil
-	  nnttrss--pending-content-ids nil
-	  nnttrss--pending-mark-updates nil)))
+(deffoo nnttrss-close-server (&optional server defs)
+  "Close connection to SERVER."
+  (ignore defs)
+  (when-let ((session (nnttrss--get-session server)))
+    (let ((sid (plist-get session :sid))
+          (address (plist-get session :address)))
+      ;; Stop sync timer
+      (nnttrss-sync-stop-timer (nnttrss--server-key server))
+      ;; Logout
+      (condition-case nil
+          (ttrss-logout address sid)
+        (error nil))
+      (nnttrss--clear-session server)))
+  t)
 
 (deffoo nnttrss-request-close ()
+  "Close all nnttrss connections."
   t)
 
 (deffoo nnttrss-server-opened (&optional server)
-  "Check if server is opened.  Non-blocking (checks local state only).
-Session validity is verified during background sync."
-  (and nnttrss--sid t))
-
-(deffoo nnttrss-request-list (&optional server)
-  "Return list of feeds from cache.  Non-blocking.
-Use `nnttrss-sync' to refresh from server."
-  (with-current-buffer nntp-server-buffer
-    (erase-buffer)
-    (dolist (feed (mapcar 'cdr nnttrss--feeds))
-      (let* ((title (plist-get feed :title))
-	     (id (plist-get feed :id))
-	     (article-ids (nnttrss--feed-articles id)))
-	(if article-ids
-	    (insert (format "\"%s\" %d %d y\n"
-			    title
-			    (apply 'max article-ids)
-			    (apply 'min article-ids)))
-	  (insert (format "\"%s\" 0 1 y\n" title)))))
-    t))
+  "Check if SERVER is opened (has valid session)."
+  (and (nnttrss--get-session server) t))
 
 (deffoo nnttrss-status-message (&optional server)
+  "Return status message for SERVER."
+  (ignore server)
   nnttrss-status-string)
 
+;;; Group operations
+
+(deffoo nnttrss-request-list (&optional server)
+  "List all feeds from storage for SERVER."
+  (let* ((srv (nnttrss--server-key server))
+         (feeds (nnttrss-storage-read-feeds srv)))
+    (with-current-buffer nntp-server-buffer
+      (erase-buffer)
+      (dolist (feed-entry feeds)
+        (let* ((group (car feed-entry))
+               (active (nnttrss-storage-read-active srv group)))
+          (if active
+              (insert (format "\"%s\" %d %d y\n"
+                              group (cdr active) (car active)))
+            (insert (format "\"%s\" 0 1 y\n" group))))))
+    t))
+
 (deffoo nnttrss-request-group (group &optional server fast info)
-  (with-current-buffer nntp-server-buffer
-    (erase-buffer)
-    (setq group (nnttrss-decode-gnus-group group))
-    (if fast
-	t
-      (let* ((feed (cdr (assoc group nnttrss--feeds)))
-	     (id (plist-get feed :id))
-	     (article-ids (nnttrss--feed-articles id))
-	     (total-articles (length article-ids)))
-	(if article-ids
-	    (insert (format "211 %d %d %d \"%s\"\n"
-			    total-articles
-			    (apply 'min article-ids)
-			    (apply 'max article-ids)
-			    (nnttrss-encode-gnus-group group)))
-	  (insert (format "211 %d %d %d \"%s\"\n"
-			  total-articles 1 0
-			  (nnttrss-encode-gnus-group group))))
-	t))))
-
-;; (deffoo nnttrss-request-group-scan (group &optional server info)
-;;   (debug))
-
-(deffoo nnttrss-retrieve-headers (articles &optional group server fetch-old)
-  (when group
-    (setq group (nnttrss-decode-gnus-group group)))
-  (with-current-buffer nntp-server-buffer
-    (erase-buffer)
-    (dolist (article articles)
-      (let* ((article-obj (nnttrss--find-article article group))
-	     (unread (plist-get article-obj :unread))
-	     (fetch (or fetch-old unread)))
-	(when fetch
-	  (when-let ((header (nnttrss--format-header article group)))
-	    (insert header))))))
-  'nov)
-
-(deffoo nnttrss-request-article (article-number &optional group server to-buffer)
-  "Retrieve article ARTICLE-NUMBER from GROUP.
-Reads from cache only - does not fetch from server."
-  (when group
-    (setq group (nnttrss-decode-gnus-group group)))
-  (let* ((destination (or to-buffer nntp-server-buffer))
-	 (group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
-	 (article-id (nnttrss--get-article-id article-number group-id))
-	 ;; Read directly from cache - no network fallback
-	 (article (when article-id (cdr (assoc article-id nnttrss--headlines)))))
-    (when article
-      (with-current-buffer destination
-	(erase-buffer)
-	(insert (format "Newgroups: %s\nSubject: %s\nFrom: %s\nDate: %s\nMIME-Version: 1.0\nContent-Type: text/html; charset=utf-8\nContent-Transfer-Encoding: quoted-printable\n\n"
-			group
-			(or (plist-get article :title) "")
-			(or (url-host (url-generic-parse-url (plist-get article :link))) "")
-			(if (plist-get article :updated)
-			    (format-time-string "%a, %d %b %Y %T %z"
-						(seconds-to-time (plist-get article :updated)))
-			  "")))
-	(insert (or (plist-get article :content) "[Content not cached - run M-x nnttrss-sync]"))
-	(insert (format "<p><a href=\"%s\">%s</a></p>"
-			(or (plist-get article :link) "")
-			(or (url-host (url-generic-parse-url (plist-get article :link))) "")))
-	(insert "\n\n")))
-    (cons group article)))
+  "Select GROUP on SERVER.
+If FAST is non-nil, just confirm group exists.
+INFO is the group info structure."
+  (ignore info)
+  (setq group (nnttrss-decode-gnus-group group))
+  (let* ((srv (nnttrss--server-key server))
+         (active (nnttrss-storage-read-active srv group)))
+    (with-current-buffer nntp-server-buffer
+      (erase-buffer)
+      (if fast
+          t
+        (if active
+            (let* ((min-art (car active))
+                   (max-art (cdr active))
+                   (count (1+ (- max-art min-art))))
+              (insert (format "211 %d %d %d \"%s\"\n"
+                              count min-art max-art
+                              (nnttrss-encode-gnus-group group))))
+          (insert (format "211 0 1 0 \"%s\"\n"
+                          (nnttrss-encode-gnus-group group))))
+        t))))
 
 (deffoo nnttrss-close-group (group &optional server)
+  "Close GROUP on SERVER."
+  (ignore group server)
   t)
 
-(deffoo nnttrss-request-update-mark (group article mark)
-  "Update marks for ARTICLE in GROUP.
-Queues mark changes for background sync - non-blocking.
+(deffoo nnttrss-request-scan (&optional group server)
+  "Trigger async sync for GROUP on SERVER."
+  (ignore group)
+  (when-let ((session (nnttrss--get-session server)))
+    (let ((address (plist-get session :address))
+          (sid (plist-get session :sid)))
+      (nnttrss-sync (nnttrss--server-key server) address sid)))
+  t)
 
-Currently `unread' and `ticked' marks are supported, the latter
-one changes 'Starred' status in TT-RSS.
-Setting up an `unread' mark removes `ticked' as well."
+;;; Article retrieval
+
+(deffoo nnttrss-retrieve-headers (articles &optional group server fetch-old)
+  "Retrieve headers for ARTICLES in GROUP on SERVER.
+FETCH-OLD is ignored (we read from cache only)."
+  (ignore fetch-old)
   (when group
     (setq group (nnttrss-decode-gnus-group group)))
-  (let* ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
-	 (article-id (nnttrss--get-article-id article group-id)))
-    (when article-id
-      (cond ((or (= mark gnus-read-mark)
-		 (= mark gnus-del-mark)
-		 (= mark gnus-catchup-mark))
-	     ;; Mark as read: field 2 (unread), mode 0 (set to false)
-	     (nnttrss--queue-mark-update article-id 2 0)
-	     (nnttrss--update-local-mark article-id :unread nil))
-	    ((= mark gnus-unread-mark)
-	     ;; Mark as unread: field 2, mode 1 (set to true)
-	     ;; Also untick: field 0 (starred), mode 0
-	     (nnttrss--queue-mark-update article-id 2 1)
-	     (nnttrss--queue-mark-update article-id 0 0)
-	     (nnttrss--update-local-mark article-id :unread t)
-	     (nnttrss--update-local-mark article-id :marked nil))
-	    ((= mark gnus-ticked-mark)
-	     ;; Star: field 0 (starred), mode 1 (set to true)
-	     (nnttrss--queue-mark-update article-id 0 1)
-	     (nnttrss--update-local-mark article-id :marked t))
-	    (t (message "nnttrss: Unknown mark setting %s" mark)))))
+  (let* ((srv (nnttrss--server-key server))
+         (headers (nnttrss-storage-read-overview srv group)))
+    (with-current-buffer nntp-server-buffer
+      (erase-buffer)
+      (dolist (article articles)
+        (when-let ((header (cl-find article headers
+                                    :key (lambda (h) (aref h 0)))))
+          (insert (format "%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\n"
+                          (aref header 0)   ; num
+                          (aref header 1)   ; subject
+                          (aref header 2)   ; from
+                          (aref header 3)   ; date
+                          (aref header 4)   ; msgid
+                          (aref header 5)   ; refs
+                          (aref header 6)   ; chars
+                          (aref header 7)   ; lines
+                          (aref header 8)   ; xref
+                          (aref header 9))) ; extra
+          ))))
+  'nov)
+
+(deffoo nnttrss-request-article (article &optional group server to-buffer)
+  "Retrieve ARTICLE from GROUP on SERVER into TO-BUFFER."
+  (when group
+    (setq group (nnttrss-decode-gnus-group group)))
+  (let* ((srv (nnttrss--server-key server))
+         (destination (or to-buffer nntp-server-buffer))
+         (num (if (numberp article) article
+                ;; Handle message-id lookup
+                (when (string-match "<\\([0-9]+\\)@" article)
+                  (string-to-number (match-string 1 article))))))
+    (when num
+      (with-current-buffer destination
+        (erase-buffer)
+        (if (nnttrss-storage-read-article srv group num)
+            (cons group num)
+          nil)))))
+
+;;; Mark operations
+
+(deffoo nnttrss-request-update-mark (group article mark)
+  "Update MARK for ARTICLE in GROUP.
+Queues mark changes for background sync."
+  (when group
+    (setq group (nnttrss-decode-gnus-group group)))
+  (let* ((srv (nnttrss--server-key (nnoo-current-server 'nnttrss)))
+         (sql-id (nnttrss-storage-num-to-id srv group article)))
+    (when sql-id
+      (cond
+       ;; Mark as read
+       ((or (= mark gnus-read-mark)
+            (= mark gnus-del-mark)
+            (= mark gnus-catchup-mark))
+        (nnttrss-sync-queue-mark srv sql-id 2 0)
+        (nnttrss--update-local-mark srv group article 'read t))
+       ;; Mark as unread
+       ((= mark gnus-unread-mark)
+        (nnttrss-sync-queue-mark srv sql-id 2 1)
+        (nnttrss-sync-queue-mark srv sql-id 0 0)  ; Also unstar
+        (nnttrss--update-local-mark srv group article 'read nil)
+        (nnttrss--update-local-mark srv group article 'tick nil))
+       ;; Mark as ticked (starred)
+       ((= mark gnus-ticked-mark)
+        (nnttrss-sync-queue-mark srv sql-id 0 1)
+        (nnttrss--update-local-mark srv group article 'tick t)))))
   mark)
+
+(deffoo nnttrss-request-set-mark (group actions &optional server)
+  "Handle mark ACTIONS for GROUP on SERVER."
+  (ignore server)
+  (when group
+    (setq group (nnttrss-decode-gnus-group group)))
+  (let ((srv (nnttrss--server-key server)))
+    (dolist (action actions)
+      (cl-destructuring-bind (range action-type marks) action
+        (let ((unread-mode (if (eq action-type 'add) 0 1))
+              (starred-mode (if (eq action-type 'add) 1 0)))
+          ;; When ticking, also mark as read
+          (when (and (memq 'tick marks) (eq action-type 'add))
+            (push 'read marks))
+          (dolist (article (range-uncompress range))
+            (when-let ((sql-id (nnttrss-storage-num-to-id srv group article)))
+              (when (memq 'read marks)
+                (nnttrss-sync-queue-mark srv sql-id 2 unread-mode)
+                (nnttrss--update-local-mark srv group article 'read
+                                            (= unread-mode 0)))
+              (when (memq 'tick marks)
+                (nnttrss-sync-queue-mark srv sql-id 0 starred-mode)
+                (nnttrss--update-local-mark srv group article 'tick
+                                            (= starred-mode 1)))))))))
+  nil)
 
 (deffoo nnttrss-request-update-info (group info &optional server)
   "Update INFO for GROUP with read and marked article ranges.
-Reads from local cache only.  Use `nnttrss-sync' to refresh from server."
+Reads from local storage only."
   (when group
     (setq group (nnttrss-decode-gnus-group group)))
-  (let* ((active (gnus-active (gnus-info-group info)))
-	 (min-article (car active))
-	 (read-articles (nnttrss--get-filtered-articles group :unread nil))
-	 (read-ranges (gnus-compress-sequence read-articles))
-	 ;; Gnus expects read ranges to start from 1, marking non-existent
-	 ;; articles as read.  Prepend (1 . min-1) when first article > 1.
-	 (read-ranges (if (and min-article (> min-article 1))
-			  (gnus-range-add `((1 . ,(1- min-article)))
-					  read-ranges)
-			read-ranges)))
+  (let* ((srv (nnttrss--server-key (or server (nnoo-current-server 'nnttrss))))
+         (active (gnus-active (gnus-info-group info)))
+         (min-article (car active))
+         (marks (nnttrss-storage-read-marks srv group))
+         (read-ranges (cdr (assq 'read marks)))
+         (tick-ranges (cdr (assq 'tick marks))))
+    ;; Gnus expects read ranges to start from 1, marking non-existent
+    ;; articles as read.  Prepend (1 . min-1) when first article > 1.
+    (when (and min-article (> min-article 1))
+      (setq read-ranges (range-concat `((1 . ,(1- min-article)))
+                                      read-ranges)))
     (setf (gnus-info-read info) read-ranges)
     (setf (gnus-info-marks info)
-	  `((tick . ,(gnus-compress-sequence
-		      (nnttrss--get-filtered-articles group :marked t)))))
-    t))
+          (when tick-ranges
+            `((tick . ,tick-ranges)))))
+  t)
 
-(deffoo nnttrss-request-set-mark (group actions &optional server)
-  "Set marks for articles in GROUP.
-Queues mark changes for background sync - non-blocking."
-  (dolist (action actions)
-    (let ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
-	  (unread-mode 0)
-	  (starred-mode 0))
-      (cl-destructuring-bind (range action-type marks) action
-	(when (and (memq 'tick marks)
-		   (eq action-type 'add))
-	  (push 'read marks))
-	(pcase action-type
-	  ('add (setf unread-mode 0
-		      starred-mode 1))
-	  ('del (setf unread-mode 1
-		      starred-mode 0)))
-	(dolist (article (gnus-uncompress-sequence range))
-	  (let ((article-id (nnttrss--get-article-id article group-id)))
-	    (when article-id
-	      (when (memq 'read marks)
-		(nnttrss--queue-mark-update article-id 2 unread-mode)
-		(nnttrss--update-local-mark article-id :unread (= unread-mode 1)))
-	      (when (memq 'tick marks)
-		(nnttrss--queue-mark-update article-id 0 starred-mode)
-		(nnttrss--update-local-mark article-id :marked (= starred-mode 1))))))))))
+(defun nnttrss--update-local-mark (server group article mark-type value)
+  "Update local mark storage for ARTICLE in GROUP on SERVER.
+MARK-TYPE is `read' or `tick'.  VALUE is t or nil."
+  (let* ((marks (nnttrss-storage-read-marks server group))
+         (current-range (cdr (assq mark-type marks)))
+         (new-range (if value
+                        (range-add-list current-range (list article))
+                      (range-remove current-range (list article))))
+         (new-marks (cl-remove mark-type marks :key #'car)))
+    (when new-range
+      (push (cons mark-type new-range) new-marks))
+    (nnttrss-storage-write-marks server group new-marks)))
 
-;;; Private bits
-
-(defun nnttrss--queue-mark-update (article-id field mode)
-  "Queue a mark update for ARTICLE-ID.
-FIELD is 0 for starred, 2 for unread. MODE is 0 to unset, 1 to set.
-Deduplicates updates: newer update for same article+field replaces older."
-  (when article-id
-    ;; Remove any existing update for same article+field
-    (setq nnttrss--pending-mark-updates
-          (cl-remove-if (lambda (entry)
-                          (and (= (plist-get entry :article-id) article-id)
-                               (= (plist-get entry :field) field)))
-                        nnttrss--pending-mark-updates))
-    ;; Add the new update
-    (push (list :article-id article-id :field field :mode mode)
-          nnttrss--pending-mark-updates)))
-
-(defun nnttrss--update-local-mark (article-id key value)
-  "Update local cache mark KEY to VALUE for ARTICLE-ID."
-  (when-let ((entry (assoc article-id nnttrss--headlines)))
-    (plist-put (cdr entry) key value)))
-
-(defun nnttrss--get-filtered-articles (group key value)
-  "Return list of articles in `GROUP' where `KEY' is eq to `VALUE'."
-  (let* ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
-	 (articles (lax-plist-get nnttrss--article-map group-id)))
-    (cl-sort
-     (delq nil
-	   (mapcar (lambda (art)
-		     (when (eq
-			    (plist-get (cdr (assoc (car art) nnttrss--headlines)) key)
-			    value)
-		       (cdr art)))
-		   articles))
-     #'<)))
-
-(defun nnttrss--update-articles-info (group)
-  "Download information on articles from `GROUP' and merges changes into
-`nnttrss--headlines'"
-  (let* ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
-	 (articles (cl-sort (mapcar #'car
-				    (lax-plist-get nnttrss--article-map group-id))
-			    #'<))
-	 (headlines (ttrss-get-headlines
-		     nnttrss-address
-		     nnttrss--sid
-		     :feed_id group-id
-		     :limit -1
-		     :since_id (car articles))))
-    (mapc (lambda (art)
-	    (let* ((article-id (plist-get art :id))
-		   (article (alist-get article-id nnttrss--headlines)))
-	      (setf (plist-get article :unread) (plist-get art :unread))
-	      (setf (plist-get article :marked) (plist-get art :marked))
-	      (when (plist-get article :marked)
-		(message "Marked article: %s" article-id))
-	      ))
-	  headlines)))
-
-(defun nnttrss--find-article (number group)
-  "Return property list for article NUMBER in GROUP.
-Returns nil if article is not found in cache."
-  (let* ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
-	 (article-id (nnttrss--get-article-id number group-id)))
-    (when article-id
-      (let* ((article (cdr (assoc article-id nnttrss--headlines)))
-	     (content (or (plist-get article :content)
-			  (when article-id
-			    (nth 1 (ttrss-get-article nnttrss-address nnttrss--sid article-id))))))
-	(when article
-	  (plist-put article :content content)
-	  (setf (cdr (assoc article-id nnttrss--headlines)) article))
-	article))))
-
-(defun nnttrss--format-header (number group)
-  "Return headline NUMBER in GROUP formatted in NOV format.
-Reads from cache only - does not fetch from server."
-  (let* ((group-id (plist-get (cdr (assoc group nnttrss--feeds)) :id))
-	 (article-id (nnttrss--get-article-id number group-id))
-	 ;; Read directly from cache - no network fallback
-	 (article (when article-id (cdr (assoc article-id nnttrss--headlines))))
-	 (size (length (or (plist-get article :content) ""))))
-    (when (and article article-id group-id)
-      (format "%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%S\n"
-	      number
-	      (or (plist-get article :title) "")
-	      (or (url-host (url-generic-parse-url (plist-get article :link))) "")
-	      (if (plist-get article :updated)
-		  (format-time-string "%a, %d %b %Y %T %z"
-				      (seconds-to-time (plist-get article :updated)))
-		"")
-	      (format "<%d@%d.nnttrss>" article-id group-id)
-	      ""
-	      size
-	      -1
-	      ""
-	      nil))))
-
-(defun nnttrss--read-vars (&rest vars)
-  "Read VARS from local file in 'nnttrss-directory'.
-Sets the variables VARS'."
-  (dolist (var vars)
-					;(setf (symbol-value var) nil)
-    (let* ((name (symbol-name var))
-	   (file (nnttrss-make-filename name))
-	   (file-name-coding-system nnmail-pathname-coding-system)
-	   (coding-system-for-read mm-universal-coding-system))
-      (when (file-exists-p file)
-	(load file nil t t)))))
-
-(defun nnttrss--write-vars (&rest vars)
-  "Write VARS from memory to local file in 'nnttrss-directory'.
-Assumes the variables VARS are set."
-  (gnus-make-directory nnttrss-directory)
-  (dolist (var vars)
-    (let* ((name (symbol-name var))
-	   (file (nnttrss-make-filename name))
-	   (file-name-coding-system nnmail-pathname-coding-system)
-	   (coding-system-for-write mm-universal-coding-system))
-      (with-temp-file (nnttrss-make-filename name)
-	(insert (format ";; -*- coding: %s; -*-\n"
-			mm-universal-coding-system))
-	(let ((value (symbol-value var)))
-	  (if (listp value)
-	      (gnus-prin1 `(setq ,var ',value))
-	    (gnus-prin1 `(setq ,var ,value))))
-	(insert "\n")))))
-
-(defun nnttrss-make-filename (name)
-  "Build filename based on NAME in 'nnttrss-directory'."
-  (expand-file-name
-   (nnrss-translate-file-chars
-    (concat name ".el"))
-   nnttrss-directory))
-
-(defun nnttrss--read-feeds ()
-  "Read feeds file in 'nnttrss-directory'.
-Sets the variable 'nnttrss--feeds."
-  (nnttrss--read-vars 'nnttrss--feeds))
-
-(defun nnttrss--write-feeds ()
-  "Write feeds from memory to local file in 'nnttrss-directory'.
-Assumes the variable 'nnttrss--feeds' is set."
-  (nnttrss--write-vars 'nnttrss--feeds))
-
-(defun nnttrss--update-feeds ()
-  "Update 'nnttrss--feeds'."
-  (let ((feeds (ttrss-get-feeds nnttrss-address
-				nnttrss--sid
-				:include_nested t
-				:cat_id -4)))
-    (setq nnttrss--feeds (mapcar (lambda (f) (cons (plist-get f :title) f))
-				 feeds)))
-  (nnttrss--write-feeds))
-
-(defun nnttrss--feed-articles (feed-id)
-  "Return list of article numbers corresponding to article IDs in FEED-ID."
-  (let ((feed-article-map (lax-plist-get nnttrss--article-map feed-id)))
-    (mapcar 'cdr feed-article-map)))
-
-(defun nnttrss--read-article-map ()
-  "Read articles mapping file in 'nnttrss-directory'.
-Sets the variables 'nnttrss--article-map and
-'nnttrss--last-article-id'."
-  (nnttrss--read-vars 'nnttrss--article-map 'nnttrss--last-article-id))
-
-(defun nnttrss--write-article-map ()
-  "Write article map from memory to local file in 'nnttrss-directory'.
-Assumes the variables 'nnttrss--article-map' and
-'nnttrss--last-article-id' are set."
-  (nnttrss--write-vars 'nnttrss--article-map 'nnttrss--last-article-id))
-
-(defun nnttrss--update-single-article-map (article-id group)
-  "Add ARTICLE-ID in GROUP to 'nnttrss--article-map'."
-  (if (not (lax-plist-get nnttrss--article-map group))
-      (setq nnttrss--article-map
-	    (lax-plist-put nnttrss--article-map group `((,article-id . 1))))
-    (let ((mapping (lax-plist-get nnttrss--article-map group)))
-      (unless (assoc article-id mapping)
-	(let* ((last-artno (cdar mapping))
-	       (next-artno (+ 1 (or last-artno 0)))
-	       (mapping (cons `(,article-id . ,next-artno) mapping)))
-	  (setq nnttrss--article-map
-		(lax-plist-put nnttrss--article-map group mapping)))))))
-
-(defun nnttrss--update-article-map ()
-  "Update 'nnttrss--article-map' with new articles in 'nnttrss--headlines'."
-  (dolist (headline (mapcar 'cdr nnttrss--headlines))
-    (let* ((article-id (plist-get headline :id))
-	   (group (plist-get headline :feed_id)))
-      (when (> article-id nnttrss--last-article-id)
-	(nnttrss--update-single-article-map article-id group))))
-  (setq nnttrss--last-article-id (apply 'max (mapcar 'car nnttrss--headlines)))
-  (nnttrss--write-article-map))
-
-(defun nnttrss--update-article-map-for-all ()
-  "Update 'nnttrss--article-map' with new articles in 'nnttrss--headlines'."
-  (dolist (headline (mapcar 'cdr nnttrss--headlines))
-    (let* ((article-id (plist-get headline :id))
-	   (group -4))
-      (when (> article-id nnttrss--last-article-id)
-	(nnttrss--update-single-article-map article-id -4))))
-  (setq nnttrss--last-article-id (apply 'max (mapcar 'car nnttrss--headlines)))
-  (nnttrss--write-article-map))
-
-(defun nnttrss--get-article-number (article-id group)
-  "Return article number corresponding to ARTICLE-ID in GROUP.
-Note that ARTICLE-ID is an internal SQL identifier obtained from the API.
-ARTICLE-NUMBER is the Gnus identifier."
-  (cdr (assoc article-id (lax-plist-get nnttrss--article-map group))))
-
-(defun nnttrss--get-article-id (article-number group)
-  "Return article id corresponding to ARTICLE-NUMBER in GROUP.
-Note that ARTICLE-ID is an internal SQL identifier obtained from the API.
-ARTICLE-NUMBER is the Gnus identifier."
-  (car (rassoc article-number (lax-plist-get nnttrss--article-map group))))
-
-(defun nnttrss--read-headlines ()
-  "Read headlines from local file in 'nnttrss-directory'.
-Sets the variables 'nnttrss--headlines'."
-  (nnttrss--read-vars 'nnttrss--headlines))
-
-(defun nnttrss--write-headlines ()
-  "Write headlines from memory to local file in 'nnttrss-directory'.
-Assumes the variable 'nnttrss--headlines' is set."
-  (nnttrss--write-vars 'nnttrss--headlines))
-
-(defun nnttrss--update-headlines ()
-  "Update 'nnttrss--headlines' since 'nnttrss--last-article-id'."
-  (let* ((headlines (ttrss-get-headlines
-		     nnttrss-address
-		     nnttrss--sid
-		     :feed_id -4
-		     :limit -1
-		     :since_id nnttrss--last-article-id
-		     :show_content (not nnttrss-fetch-partial-articles))))
-    (setq nnttrss--headlines (append nnttrss--headlines
-				     (mapcar (lambda (h)
-					       (cons (plist-get h :id) h))
-					     headlines))))
-  (nnttrss--write-headlines))
-
-;;; Async machinery
-
-(defun nnttrss--start-sync-timer ()
-  "Start the background sync timer if `nnttrss-sync-interval' is set."
-  (nnttrss--stop-sync-timer)
-  (when nnttrss-sync-interval
-    (setq nnttrss--sync-timer
-          (run-with-timer nnttrss-sync-interval
-                          nnttrss-sync-interval
-                          #'nnttrss--sync-async))))
-
-(defun nnttrss--stop-sync-timer ()
-  "Stop the background sync timer."
-  (when nnttrss--sync-timer
-    (cancel-timer nnttrss--sync-timer)
-    (setq nnttrss--sync-timer nil)))
-
-(defun nnttrss--sync-async ()
-  "Asynchronously sync feeds and headlines from server.
-Updates local cache without blocking Emacs."
-  (when (and nnttrss--sid (not nnttrss--sync-in-progress))
-    (setq nnttrss--sync-in-progress t)
-    ;; First flush any pending mark updates
-    (if nnttrss--pending-mark-updates
-        (progn
-          (message "nnttrss: Syncing %d pending mark changes..."
-                   (length nnttrss--pending-mark-updates))
-          (nnttrss--flush-pending-marks))
-      ;; No pending marks, proceed directly to feed sync
-      (nnttrss--continue-sync-feeds))))
-
-(defun nnttrss--continue-sync-feeds ()
-  "Continue sync by fetching feeds from server."
-  (message "nnttrss: Syncing feeds...")
-  (ttrss-get-feeds-async
-   nnttrss-address
-   nnttrss--sid
-   #'nnttrss--sync-feeds-callback
-   #'nnttrss--sync-error-callback
-   :include_nested t
-   :cat_id -4))
-
-(defun nnttrss--flush-pending-marks ()
-  "Flush pending mark updates to server asynchronously.
-Groups updates by field for efficiency."
-  (let ((unread-true '())   ; articles to mark unread (mode 1, field 2)
-        (unread-false '())  ; articles to mark read (mode 0, field 2)
-        (starred-true '())  ; articles to star (mode 1, field 0)
-        (starred-false '())) ; articles to unstar (mode 0, field 0)
-    ;; Group updates by field and mode
-    (dolist (update nnttrss--pending-mark-updates)
-      (let ((id (plist-get update :article-id))
-            (field (plist-get update :field))
-            (mode (plist-get update :mode)))
-        (cond ((and (= field 2) (= mode 1)) (push id unread-true))
-              ((and (= field 2) (= mode 0)) (push id unread-false))
-              ((and (= field 0) (= mode 1)) (push id starred-true))
-              ((and (= field 0) (= mode 0)) (push id starred-false)))))
-    ;; Clear the queue now - callbacks will continue the chain
-    (setq nnttrss--pending-mark-updates nil)
-    ;; Send grouped updates in sequence
-    (nnttrss--send-mark-updates
-     (list (cons (cons 2 1) unread-true)
-           (cons (cons 2 0) unread-false)
-           (cons (cons 0 1) starred-true)
-           (cons (cons 0 0) starred-false)))))
-
-(defun nnttrss--send-mark-updates (groups)
-  "Send mark updates for GROUPS, then continue sync.
-GROUPS is a list of ((field . mode) . article-ids)."
-  (let ((remaining (cl-remove-if (lambda (g) (null (cdr g))) groups)))
-    (if (null remaining)
-        ;; All done, continue to feeds
-        (nnttrss--continue-sync-feeds)
-      ;; Send first group
-      (let* ((group (car remaining))
-             (field (caar group))
-             (mode (cdar group))
-             (ids (cdr group)))
-        (ttrss-update-article-async
-         nnttrss-address
-         nnttrss--sid
-         ids
-         (lambda (_result)
-           ;; Continue with remaining groups
-           (nnttrss--send-mark-updates (cdr remaining)))
-         #'nnttrss--sync-error-callback
-         :mode mode
-         :field field)))))
-
-(defun nnttrss--sync-feeds-callback (feeds)
-  "Callback for async feeds fetch. FEEDS is the list of feed plists."
-  (setq nnttrss--feeds (mapcar (lambda (f) (cons (plist-get f :title) f))
-                               feeds))
-  (nnttrss--write-feeds)
-  (ttrss-get-headlines-async
-   nnttrss-address
-   nnttrss--sid
-   #'nnttrss--sync-headlines-callback
-   #'nnttrss--sync-error-callback
-   :feed_id -4
-   :limit -1
-   :since_id nnttrss--last-article-id
-   :show_content (not nnttrss-fetch-partial-articles)))
-
-(defun nnttrss--sync-headlines-callback (headlines)
-  "Callback for async headlines fetch. HEADLINES is the list of headline plists."
-  (setq nnttrss--headlines (append nnttrss--headlines
-                                   (mapcar (lambda (h)
-                                             (cons (plist-get h :id) h))
-                                           headlines)))
-  (nnttrss--write-headlines)
-  (nnttrss--update-article-map)
-  (message "nnttrss: Updating marks...")
-  (ttrss-get-headlines-async
-   nnttrss-address
-   nnttrss--sid
-   #'nnttrss--sync-unread-callback
-   #'nnttrss--sync-error-callback
-   :feed_id -4
-   :view_mode "unread"
-   :limit -1))
-
-(defun nnttrss--sync-unread-callback (unread-headlines)
-  "Callback for unread articles fetch.  Updates unread marks in cache."
-  (let ((unread-set (make-hash-table :test 'eq)))
-    (dolist (h unread-headlines)
-      (puthash (plist-get h :id) t unread-set))
-    (dolist (entry nnttrss--headlines)
-      (let ((article (cdr entry)))
-        (plist-put article :unread (gethash (plist-get article :id) unread-set)))))
-  (ttrss-get-headlines-async
-   nnttrss-address
-   nnttrss--sid
-   #'nnttrss--sync-marked-callback
-   #'nnttrss--sync-error-callback
-   :feed_id -4
-   :view_mode "marked"
-   :limit -1))
-
-(defun nnttrss--sync-marked-callback (marked-headlines)
-  "Callback for marked articles fetch.  Updates starred marks in cache."
-  (let ((marked-set (make-hash-table :test 'eq)))
-    (dolist (h marked-headlines)
-      (puthash (plist-get h :id) t marked-set))
-    (dolist (entry nnttrss--headlines)
-      (let ((article (cdr entry)))
-        (plist-put article :marked (gethash (plist-get article :id) marked-set)))))
-  (nnttrss--write-headlines)
-  ;; Step 6: Fetch missing article content if enabled
-  (if nnttrss-cache-full-content
-      (nnttrss--sync-fetch-missing-content)
-    (nnttrss--sync-complete)))
-
-(defun nnttrss--sync-fetch-missing-content ()
-  "Fetch content for articles that don't have it cached."
-  (let ((missing-ids '()))
-    ;; Find articles without content
-    (dolist (entry nnttrss--headlines)
-      (let ((article (cdr entry)))
-        (unless (plist-get article :content)
-          (push (plist-get article :id) missing-ids))))
-    (if missing-ids
-        (progn
-          (message "nnttrss: Fetching content for %d articles..." (length missing-ids))
-          ;; Store the list for batch processing
-          (setq nnttrss--pending-content-ids (nreverse missing-ids))
-          (nnttrss--fetch-content-batch))
-      (nnttrss--sync-complete))))
-
-(defvar nnttrss--pending-content-ids nil
-  "List of article IDs still needing content fetch.")
-
-(defun nnttrss--fetch-content-batch ()
-  "Fetch content for a batch of articles."
-  (if (null nnttrss--pending-content-ids)
-      (nnttrss--sync-complete)
-    ;; Take a batch
-    (let ((batch '())
-          (count 0))
-      (while (and nnttrss--pending-content-ids
-                  (< count nnttrss-content-fetch-batch-size))
-        (push (pop nnttrss--pending-content-ids) batch)
-        (cl-incf count))
-      ;; Fetch this batch
-      (apply #'ttrss-get-article-async
-             nnttrss-address
-             nnttrss--sid
-             #'nnttrss--sync-content-callback
-             #'nnttrss--sync-error-callback
-             (nreverse batch)))))
-
-(defun nnttrss--sync-content-callback (articles)
-  "Callback for article content fetch. ARTICLES is list of article plists."
-  (dolist (article articles)
-    (let* ((id (plist-get article :id))
-           (entry (assoc id nnttrss--headlines)))
-      (when entry
-        (plist-put (cdr entry) :content (plist-get article :content)))))
-  ;; Continue with next batch or finish
-  (if nnttrss--pending-content-ids
-      (progn
-        (message "nnttrss: %d articles remaining..."
-                 (length nnttrss--pending-content-ids))
-        (nnttrss--fetch-content-batch))
-    (nnttrss--write-headlines)
-    (nnttrss--sync-complete)))
-
-(defun nnttrss--sync-complete ()
-  "Finalize sync and report completion."
-  (setq nnttrss--sync-in-progress nil
-        nnttrss--pending-content-ids nil)
-  ;; Run cache cleanup if configured
-  (when (or nnttrss-cache-max-age nnttrss-cache-max-articles-per-feed)
-    (nnttrss--cleanup-cache))
-  (message "nnttrss: Sync complete (%d feeds, %d articles)"
-           (length nnttrss--feeds)
-           (length nnttrss--headlines)))
-
-(defun nnttrss--sync-error-callback (error-msg)
-  "Callback for sync errors.  ERROR-MSG is the error description.
-Attempts re-login if session expired."
-  (setq nnttrss--sync-in-progress nil
-        nnttrss--pending-content-ids nil)
-  (if (string-match-p "not logged in\\|login\\|session" (downcase error-msg))
-      (progn
-        (message "nnttrss: Session expired, re-logging in...")
-        (condition-case err
-            (let ((sid (ttrss-login nnttrss-address nnttrss-user nnttrss-password)))
-              (setq nnttrss--sid sid)
-              (message "nnttrss: Re-login successful, retrying sync...")
-              (nnttrss--sync-async))
-          (error
-           (message "nnttrss: Re-login failed - %s" (error-message-string err)))))
-    (message "nnttrss: Sync failed - %s" error-msg)))
+;;; Interactive commands
 
 ;;;###autoload
-(defun nnttrss-sync ()
-  "Manually trigger an asynchronous sync from TT-RSS server.
-Updates feeds and headlines in the background without blocking Emacs.
-After sync completes, press `g' in the Group buffer to see updates."
+(defun nnttrss-sync-now ()
+  "Manually trigger sync for the current nnttrss server.
+Use this to refresh feeds without waiting for the timer."
   (interactive)
-  (if nnttrss--sync-in-progress
-      (message "nnttrss: Sync already in progress")
-    (if nnttrss--sid
-        (nnttrss--sync-async)
-      (message "nnttrss: Not connected to server"))))
-
-;;; Cache cleanup
-
-(defun nnttrss--cleanup-cache ()
-  "Clean up old and excess articles from cache.
-Removes articles based on `nnttrss-cache-max-age' and
-`nnttrss-cache-max-articles-per-feed' settings."
-  (let ((removed-age 0)
-        (removed-size 0))
-    ;; Age-based cleanup
-    (when nnttrss-cache-max-age
-      (let ((cutoff-time (- (float-time) (* nnttrss-cache-max-age 24 60 60))))
-        (setq removed-age (nnttrss--cleanup-by-age cutoff-time))))
-    ;; Size-based cleanup (per feed)
-    (when nnttrss-cache-max-articles-per-feed
-      (setq removed-size (nnttrss--cleanup-by-size)))
-    ;; Update article map to remove stale references
-    (when (> (+ removed-age removed-size) 0)
-      (nnttrss--cleanup-article-map)
-      (nnttrss--write-headlines)
-      (nnttrss--write-article-map)
-      (message "nnttrss: Cleanup removed %d old + %d excess articles"
-               removed-age removed-size))))
-
-(defun nnttrss--cleanup-by-age (cutoff-time)
-  "Remove articles older than CUTOFF-TIME. Return count removed."
-  (let ((removed 0)
-        (new-headlines '()))
-    (dolist (entry nnttrss--headlines)
-      (let* ((article (cdr entry))
-             (updated (plist-get article :updated)))
-        (if (and updated (< updated cutoff-time))
-            (cl-incf removed)
-          (push entry new-headlines))))
-    (setq nnttrss--headlines (nreverse new-headlines))
-    removed))
-
-(defun nnttrss--cleanup-by-size ()
-  "Remove excess articles per feed. Return count removed."
-  (let ((removed 0)
-        (feed-articles (make-hash-table :test 'eq)))
-    ;; Group articles by feed
-    (dolist (entry nnttrss--headlines)
-      (let* ((article (cdr entry))
-             (feed-id (plist-get article :feed_id)))
-        (puthash feed-id
-                 (cons entry (gethash feed-id feed-articles))
-                 feed-articles)))
-    ;; Keep only newest N per feed
-    (let ((new-headlines '()))
-      (maphash
-       (lambda (feed-id articles)
-         ;; Sort by updated time (newest first)
-         (let ((sorted (sort articles
-                             (lambda (a b)
-                               (> (or (plist-get (cdr a) :updated) 0)
-                                  (or (plist-get (cdr b) :updated) 0))))))
-           ;; Keep only max articles
-           (let ((count 0))
-             (dolist (entry sorted)
-               (if (< count nnttrss-cache-max-articles-per-feed)
-                   (progn
-                     (push entry new-headlines)
-                     (cl-incf count))
-                 (cl-incf removed))))))
-       feed-articles)
-      (setq nnttrss--headlines new-headlines))
-    removed))
-
-(defun nnttrss--cleanup-article-map ()
-  "Remove article map entries for articles no longer in headlines."
-  (let ((valid-ids (make-hash-table :test 'eq)))
-    ;; Build set of valid article IDs
-    (dolist (entry nnttrss--headlines)
-      (puthash (car entry) t valid-ids))
-    ;; Filter article map
-    (let ((new-map '()))
-      (cl-loop for (feed-id mappings) on nnttrss--article-map by #'cddr
-               do (let ((valid-mappings
-                         (cl-remove-if-not
-                          (lambda (m) (gethash (car m) valid-ids))
-                          mappings)))
-                    (when valid-mappings
-                      (setq new-map (plist-put new-map feed-id valid-mappings)))))
-      (setq nnttrss--article-map new-map))))
-
-;;;###autoload
-(defun nnttrss-cleanup-cache ()
-  "Manually trigger cache cleanup.
-Removes old articles and excess articles per feed based on
-`nnttrss-cache-max-age' and `nnttrss-cache-max-articles-per-feed'."
-  (interactive)
-  (if (or nnttrss-cache-max-age nnttrss-cache-max-articles-per-feed)
-      (nnttrss--cleanup-cache)
-    (message "nnttrss: No cleanup limits configured")))
+  (let ((server (when (boundp 'gnus-current-select-method)
+                  (cadr gnus-current-select-method))))
+    (if-let ((session (nnttrss--get-session server)))
+        (let ((address (plist-get session :address))
+              (sid (plist-get session :sid)))
+          (nnttrss-sync (nnttrss--server-key server) address sid))
+      (message "nnttrss: No active session"))))
 
 (provide 'nnttrss)
 ;;; nnttrss.el ends here

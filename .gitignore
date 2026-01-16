@@ -1,0 +1,21 @@
+# Byte-compiled files
+*.elc
+
+# Eask local directory
+.eask/
+
+# Coverage output
+coverage.lcov
+coverage.json
+coverage/
+
+# Elsa cache
+.elsa/
+
+# Backup files
+*~
+\#*\#
+.\#*
+
+# OS files
+.DS_Store

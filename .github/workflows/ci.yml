@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        emacs-version: ['29.1', '29.4']
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs-version }}
+
+      - uses: emacs-eask/setup-eask@master
+        with:
+          version: 'snapshot'
+
+      - name: Install dependencies
+        run: eask install-deps --dev
+
+      - name: Byte compile
+        run: eask compile
+
+      - name: Lint (checkdoc)
+        run: eask lint checkdoc
+
+      - name: Lint (package)
+        run: eask lint package
+        continue-on-error: true
+
+      - name: Run tests
+        run: eask test ert tests/*.el
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: purcell/setup-emacs@master
+        with:
+          version: '29.4'
+
+      - uses: emacs-eask/setup-eask@master
+        with:
+          version: 'snapshot'
+
+      - name: Install dependencies
+        run: eask install-deps --dev
+
+      - name: Run tests with coverage
+        run: eask eval "(load \"scripts/run-coverage.el\")"
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.lcov
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: purcell/setup-emacs@master
+        with:
+          version: '29.4'
+
+      - uses: emacs-eask/setup-eask@master
+        with:
+          version: 'snapshot'
+
+      - name: Package
+        run: eask package
+
+      - name: Install package
+        run: eask install
