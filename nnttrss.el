@@ -310,20 +310,26 @@ Setting up an `unread' mark removes `ticked' as well."
 	    (t (message "nnttrss: Unknown mark setting %s" mark)))))
   mark)
 
-(deffoo nnttrss-request-update-info  (group info &optional server)
-  "Update INFO for GROUP about marked and unread articles.
-Reads from cache only - use `nnttrss-sync' to refresh from server."
+(deffoo nnttrss-request-update-info (group info &optional server)
+  "Update INFO for GROUP with read and marked article ranges.
+Reads from local cache only.  Use `nnttrss-sync' to refresh from server."
   (when group
     (setq group (nnttrss-decode-gnus-group group)))
-  (let* ((feed (cdr (assoc group nnttrss--feeds)))
-	 (id (plist-get feed :id)))
-    (setf (gnus-info-read info)
-	  (gnus-compress-sequence
-	   (nnttrss--get-filtered-articles group :unread nil)))
+  (let* ((active (gnus-active (gnus-info-group info)))
+	 (min-article (car active))
+	 (read-articles (nnttrss--get-filtered-articles group :unread nil))
+	 (read-ranges (gnus-compress-sequence read-articles))
+	 ;; Gnus expects read ranges to start from 1, marking non-existent
+	 ;; articles as read.  Prepend (1 . min-1) when first article > 1.
+	 (read-ranges (if (and min-article (> min-article 1))
+			  (gnus-range-add `((1 . ,(1- min-article)))
+					  read-ranges)
+			read-ranges)))
+    (setf (gnus-info-read info) read-ranges)
     (setf (gnus-info-marks info)
-	  (list (cons 'tick
-		      (gnus-compress-sequence
-		       (nnttrss--get-filtered-articles group :marked t)))))))
+	  `((tick . ,(gnus-compress-sequence
+		      (nnttrss--get-filtered-articles group :marked t)))))
+    t))
 
 (deffoo nnttrss-request-set-mark (group actions &optional server)
   "Set marks for articles in GROUP.
