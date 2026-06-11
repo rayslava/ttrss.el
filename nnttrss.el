@@ -71,7 +71,7 @@
 
 (nnoo-declare nnttrss)
 (nnoo-define-basics nnttrss)
-(gnus-declare-backend "nnttrss" 'news 'address 'agent)
+(gnus-declare-backend "nnttrss" 'news 'address 'agent 'server-marks)
 
 ;;; Server variables
 
