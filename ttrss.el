@@ -150,6 +150,19 @@
 
 ;;; Utilities
 
+(defmacro ttrss--with-response-buffer (&rest body)
+  "Run BODY in the current url response buffer, then kill that buffer.
+`url-retrieve' never kills its response buffers, so without this every
+request leaks one."
+  (declare (indent 0) (debug t))
+  (let ((buf (make-symbol "buf")))
+    `(let ((,buf (current-buffer)))
+       (unwind-protect
+	   (progn ,@body)
+	 (when (buffer-live-p ,buf)
+	   (let ((kill-buffer-query-functions nil))
+	     (kill-buffer ,buf)))))))
+
 (defun ttrss-post-request (address property &rest content)
   "Post to ADDRESS and possibly retrieve PROPERTY from the response to CONTENT.
 CONTENT must be a data structure that `json-encode' knows how to
@@ -161,7 +174,8 @@ otherwise."
   (let ((url-request-method "POST")
 	(url-request-data (json-encode content)))
     (with-current-buffer (url-retrieve-synchronously address)
-      (ttrss-parse-request nil property))))
+      (ttrss--with-response-buffer
+	(ttrss-parse-request nil property)))))
 
 (defun ttrss-post-request-asynchronously (address &rest content)
   "Asynchronously post to ADDRESS the key-value pairs CONTENT.
@@ -169,7 +183,10 @@ Like 'ttrss-post-request', but perform request asynchronously
 with 'ttrss-parse-request' as a callback."
   (let ((url-request-method "POST")
 	(url-request-data (json-encode content)))
-    (url-retrieve address 'ttrss-parse-request)))
+    (url-retrieve address
+		  (lambda (status)
+		    (ttrss--with-response-buffer
+		      (ttrss-parse-request status))))))
 
 (defun ttrss-post-request-async (address callback &optional error-callback &rest content)
   "Post CONTENT to ADDRESS asynchronously, call CALLBACK with result.
@@ -181,19 +198,20 @@ If ERROR-CALLBACK is nil, errors are reported via `message'."
     (url-retrieve
      address
      (lambda (status callback error-callback)
-       (if-let ((err (plist-get status :error)))
-           (let ((msg (format "Network error: %s" (cdr err))))
-             (if error-callback
-                 (funcall error-callback msg)
-               (message "ttrss: %s" msg)))
-         (condition-case err
-             (let ((result (ttrss-parse-request nil)))
-               (funcall callback result))
-           (error
-            (let ((msg (format "Parse error: %s" (error-message-string err))))
-              (if error-callback
-                  (funcall error-callback msg)
-                (message "ttrss: %s" msg)))))))
+       (ttrss--with-response-buffer
+         (if-let ((err (plist-get status :error)))
+             (let ((msg (format "Network error: %s" (cdr err))))
+               (if error-callback
+                   (funcall error-callback msg)
+                 (message "ttrss: %s" msg)))
+           (condition-case err
+               (let ((result (ttrss-parse-request nil)))
+                 (funcall callback result))
+             (error
+              (let ((msg (format "Parse error: %s" (error-message-string err))))
+                (if error-callback
+                    (funcall error-callback msg)
+                  (message "ttrss: %s" msg))))))))
      (list callback error-callback)
      t)))
 
