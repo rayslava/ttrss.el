@@ -45,6 +45,9 @@
 (defvar nnttrss-storage--id-map-cache (make-hash-table :test 'equal)
   "Cache of ID maps: (server . group) -> hash-table.")
 
+(defvar nnttrss-storage--unavailable-cache (make-hash-table :test 'equal)
+  "Cache of unavailable article sets: server -> hash-table of SQL IDs.")
+
 ;;; Directory management
 
 (defun nnttrss-storage-server-dir (server)
@@ -327,6 +330,43 @@ Returns alist of (group-name . plist) where plist contains feed info."
             (print-level nil))
         (prin1 feeds (current-buffer))))))
 
+;;; Unavailable articles
+;;
+;; Articles the server no longer has (purged by TT-RSS) keep their ID map
+;; entries but can never get content, so without this set every sync would
+;; request them again.
+
+(defun nnttrss-storage--unavailable-file (server)
+  "Return path to the unavailable article IDs file for SERVER."
+  (expand-file-name ".unavailable"
+                    (nnttrss-storage-server-dir server)))
+
+(defun nnttrss-storage-read-unavailable (server)
+  "Return hash-table of SQL IDs whose content SERVER no longer provides."
+  (or (gethash server nnttrss-storage--unavailable-cache)
+      (let ((file (nnttrss-storage--unavailable-file server))
+            (set (make-hash-table :test 'eql)))
+        (when (file-exists-p file)
+          (with-temp-buffer
+            (insert-file-contents file)
+            (dolist (id (read (current-buffer)))
+              (puthash id t set))))
+        (puthash server set nnttrss-storage--unavailable-cache))))
+
+(defun nnttrss-storage-add-unavailable (server sql-ids)
+  "Record SQL-IDS as unavailable on SERVER."
+  (when sql-ids
+    (let ((set (nnttrss-storage-read-unavailable server))
+          ids)
+      (dolist (id sql-ids)
+        (puthash id t set))
+      (maphash (lambda (id _) (push id ids)) set)
+      (nnttrss-storage-init server)
+      (with-temp-file (nnttrss-storage--unavailable-file server)
+        (let ((print-length nil)
+              (print-level nil))
+          (prin1 (sort ids #'<) (current-buffer)))))))
+
 ;;; Cleanup operations
 
 (defun nnttrss-storage-expire-articles (server group keep-days)
@@ -356,6 +396,7 @@ Returns number of articles deleted."
       (let ((dir (nnttrss-storage-server-dir server)))
         (when (file-directory-p dir)
           (delete-directory dir t)))
+      (remhash server nnttrss-storage--unavailable-cache)
       ;; Clear all cached maps for this server
       (maphash (lambda (key _val)
                  (when (equal (car key) server)

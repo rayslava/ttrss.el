@@ -47,6 +47,14 @@ This makes opening articles instant but increases storage size."
   :type 'integer
   :group 'nnttrss-sync)
 
+(defcustom nnttrss-sync-stale-timeout 600
+  "Seconds after which a sync still marked in progress is considered dead.
+A request that never completes (e.g. the network dropped mid-sync) would
+otherwise block every later sync.  The next sync attempt after this
+timeout discards the dead one and starts over."
+  :type 'integer
+  :group 'nnttrss-sync)
+
 (defcustom nnttrss-cache-max-age 90
   "Maximum age in days for cached articles.
 Articles older than this are removed during cleanup.
@@ -73,7 +81,7 @@ Called with three arguments: server, num-feeds, num-articles.")
   "Hash table of server -> sync timer.")
 
 (defvar nnttrss-sync--in-progress (make-hash-table :test 'equal)
-  "Hash table of server -> sync-in-progress flag.")
+  "Hash table of server -> start time (`float-time') of the running sync.")
 
 (defvar nnttrss-sync--pending-marks (make-hash-table :test 'equal)
   "Hash table of server -> list of pending mark updates.
@@ -110,9 +118,22 @@ Context contains :address, :sid, :feeds-count, :articles-count.")
 (defun nnttrss-sync (server address sid)
   "Manually trigger async sync for SERVER.
 ADDRESS and SID are the TT-RSS server address and session ID."
-  (if (gethash server nnttrss-sync--in-progress)
+  (if (nnttrss-sync--in-progress-p server)
       (message "nnttrss: Sync already in progress for %s" server)
     (nnttrss-sync--async server address sid)))
+
+(defun nnttrss-sync--in-progress-p (server)
+  "Return non-nil if a live sync is running for SERVER.
+A sync started more than `nnttrss-sync-stale-timeout' seconds ago is
+cancelled and treated as not running."
+  (when-let* ((started (gethash server nnttrss-sync--in-progress)))
+    (if (or (not (numberp started))
+            (< (- (float-time) started) nnttrss-sync-stale-timeout))
+        t
+      (message "nnttrss: Sync for %s stalled for %ds, restarting"
+               server (round (- (float-time) started)))
+      (nnttrss-sync-cancel server)
+      nil)))
 
 (defun nnttrss-sync-cancel (server)
   "Cancel any running sync for SERVER."
@@ -153,8 +174,8 @@ Deduplicates updates: newer update for same article+field replaces older."
 (defun nnttrss-sync--async (server address sid)
   "Asynchronously sync feeds and headlines for SERVER.
 ADDRESS is the TT-RSS API URL, SID is the session ID."
-  (when (and sid (not (gethash server nnttrss-sync--in-progress)))
-    (puthash server t nnttrss-sync--in-progress)
+  (when (and sid (not (nnttrss-sync--in-progress-p server)))
+    (puthash server (float-time) nnttrss-sync--in-progress)
     (puthash server (list :address address :sid sid
                           :feeds-count 0 :articles-count 0)
              nnttrss-sync--context)
@@ -473,14 +494,16 @@ X-TTRSS-Link: %s
 (defun nnttrss-sync--check-missing-content (server)
   "Check for articles missing content on SERVER."
   (let ((missing-ids '())
-        (feeds (nnttrss-storage-read-feeds server)))
-    ;; Find articles without content
+        (feeds (nnttrss-storage-read-feeds server))
+        (unavailable (nnttrss-storage-read-unavailable server)))
+    ;; Find articles without content, skipping ones the server no longer has
     (dolist (feed-entry feeds)
       (let* ((group (car feed-entry))
              (id-map (nnttrss-storage-read-id-map server group)))
         (when id-map
           (maphash (lambda (sql-id num)
-                     (unless (nnttrss-storage-article-exists-p server group num)
+                     (unless (or (gethash sql-id unavailable)
+                                 (nnttrss-storage-article-exists-p server group num))
                        (push sql-id missing-ids)))
                    id-map))))
     (if missing-ids
@@ -506,17 +529,25 @@ X-TTRSS-Link: %s
         ;; Fetch this batch
         (let* ((ctx (gethash server nnttrss-sync--context))
                (address (plist-get ctx :address))
-               (sid (plist-get ctx :sid)))
+               (sid (plist-get ctx :sid))
+               (requested (nreverse batch)))
           (apply #'ttrss-get-article-async
                  address sid
                  (lambda (articles)
-                   (nnttrss-sync--content-callback server articles))
+                   (nnttrss-sync--content-callback server articles requested))
                  (lambda (err)
                    (nnttrss-sync--error server err))
-                 (nreverse batch)))))))
+                 requested))))))
 
-(defun nnttrss-sync--content-callback (server articles)
-  "Handle ARTICLES content response for SERVER."
+(defun nnttrss-sync--content-callback (server articles requested)
+  "Handle ARTICLES content response for SERVER.
+REQUESTED is the list of SQL IDs asked for; any the server did not
+return are recorded as unavailable so later syncs stop requesting them."
+  (let ((returned (make-hash-table :test 'eql)))
+    (dolist (article articles)
+      (puthash (plist-get article :id) t returned))
+    (nnttrss-storage-add-unavailable
+     server (cl-remove-if (lambda (id) (gethash id returned)) requested)))
   (let ((feeds (nnttrss-storage-read-feeds server))
         (feed-map (make-hash-table :test 'eq)))
     ;; Build feed-id -> group map
