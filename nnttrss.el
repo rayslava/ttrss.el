@@ -370,10 +370,20 @@ MARK-TYPE is `read' or `tick'.  VALUE is t or nil."
 ;;;###autoload
 (defun nnttrss-sync-now ()
   "Manually trigger sync for the current nnttrss server.
-Use this to refresh feeds without waiting for the timer."
+Use this to refresh feeds without waiting for the timer.
+Falls back to the first configured nnttrss select method, opening the
+server if no session is active."
   (interactive)
-  (let ((server (when (boundp 'gnus-current-select-method)
-                  (cadr gnus-current-select-method))))
+  (let* ((method (or (when (boundp 'gnus-current-select-method)
+                       (let ((m gnus-current-select-method))
+                         (when (eq (car m) 'nnttrss) m)))
+                     (when (boundp 'gnus-secondary-select-methods)
+                       (cl-some (lambda (m)
+                                  (when (eq (car m) 'nnttrss) m))
+                                gnus-secondary-select-methods))))
+         (server (cadr method)))
+    (when (and method (not (nnttrss--get-session server)))
+      (gnus-open-server method))
     (if-let ((session (nnttrss--get-session server)))
         (let ((address (plist-get session :address))
               (sid (plist-get session :sid)))

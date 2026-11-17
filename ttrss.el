@@ -172,7 +172,8 @@ Returns the JSON response as a property list (or, optionally, the
 PROPERTY in the property list) if the response status is 0, nil
 otherwise."
   (let ((url-request-method "POST")
-	(url-request-data (json-encode content)))
+	(url-request-data (json-encode content))
+	(url-request-extra-headers '(("Content-Type" . "application/json"))))
     (with-current-buffer (url-retrieve-synchronously address)
       (ttrss--with-response-buffer
 	(ttrss-parse-request nil property)))))
@@ -182,7 +183,8 @@ otherwise."
 Like 'ttrss-post-request', but perform request asynchronously
 with 'ttrss-parse-request' as a callback."
   (let ((url-request-method "POST")
-	(url-request-data (json-encode content)))
+	(url-request-data (json-encode content))
+	(url-request-extra-headers '(("Content-Type" . "application/json"))))
     (url-retrieve address
 		  (lambda (status)
 		    (ttrss--with-response-buffer
@@ -194,7 +196,8 @@ CALLBACK is called with parsed JSON response (plist) on success.
 ERROR-CALLBACK is called with error message string on failure.
 If ERROR-CALLBACK is nil, errors are reported via `message'."
   (let ((url-request-method "POST")
-        (url-request-data (json-encode content)))
+        (url-request-data (json-encode content))
+        (url-request-extra-headers '(("Content-Type" . "application/json"))))
     (url-retrieve
      address
      (lambda (status callback error-callback)
